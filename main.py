@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import os
 import random
 import re
 import urllib.parse
@@ -9,6 +10,7 @@ from typing import Any
 
 import pandas as pd
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
@@ -16,7 +18,7 @@ from playwright.async_api import async_playwright
 # 智联搜索入口。关键词通过 query 参数传入，由站点自动跳转到对应 kw 加密路径。
 ZHAOPIN_SEARCH_URL = "https://www.zhaopin.com/sou/"
 
-CONFIG_FILE_NAME = "config.json"
+ENV_FILE_NAME = ".env"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "keywords": ["数据分析"],
@@ -306,150 +308,89 @@ def parse_positive_int(value: Any, default: int) -> int:
         return default
 
 
-def parse_delay_range(delays: dict[str, Any], key: str, default: tuple[float, float]) -> tuple[float, float]:
-    """解析延时范围配置。"""
-    value = delays.get(key, default)
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        return default
+def load_env_config(env_path: Path) -> dict[str, Any]:
+    """加载并解析 .env 文件。"""
+    if env_path.exists():
+        load_dotenv(env_path)
+    else:
+        print(f"警告：未找到 {env_path.name} 文件，将尝试使用环境变量。")
 
-    try:
-        low = float(value[0])
-        high = float(value[1])
-    except (TypeError, ValueError):
-        return default
-
-    if low <= 0 or high <= 0:
-        return default
-    if low > high:
-        low, high = high, low
-    return low, high
-
-
-def normalize_keywords(config: dict[str, Any]) -> list[str]:
-    """从配置中归一化关键词列表。"""
-    raw_keywords = config.get("keywords", [])
-    if isinstance(raw_keywords, str):
-        raw_keywords = [raw_keywords]
-    if not isinstance(raw_keywords, list):
-        raw_keywords = []
-
-    # 兼容旧写法 keyword: "..."
-    legacy_keyword = config.get("keyword")
-    if isinstance(legacy_keyword, str) and legacy_keyword.strip():
-        raw_keywords.append(legacy_keyword)
-
-    result = []
+    raw_keywords = os.getenv("KEYWORDS", "").split(",")
+    keywords = []
     seen = set()
-    for item in raw_keywords:
-        text = clean_text(str(item))
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-
-    return result
-
-
-def normalize_regions(config: dict[str, Any]) -> list[str]:
-    """解析地区配置，仅使用城市名称；为空时使用默认北上广深杭。"""
-    raw_regions = config.get("regions", [])
-    if isinstance(raw_regions, str):
-        raw_regions = [raw_regions]
-    if not isinstance(raw_regions, list):
-        raw_regions = []
-
-    if not raw_regions:
-        defaults = config.get("default_regions", [])
-        if isinstance(defaults, str):
-            defaults = [defaults]
-        if isinstance(defaults, list):
-            raw_regions = defaults
-
-    resolved = []
-    seen = set()
-    for region in raw_regions:
-        city_name = clean_text(str(region))
-        if not city_name:
-            continue
-
-        normalized = city_name[:-1] if city_name.endswith("市") else city_name
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        resolved.append(normalized)
-
-    return resolved
-
-
-def load_config(config_path: Path) -> dict[str, Any]:
-    """加载并归一化 config.json。"""
-    if not config_path.exists():
-        raise FileNotFoundError(f"未找到配置文件：{config_path}")
-
-    with config_path.open("r", encoding="utf-8") as f:
-        raw_config = json.load(f)
-
-    if not isinstance(raw_config, dict):
-        raise ValueError("config.json 顶层必须是 JSON 对象")
-
-    config = copy.deepcopy(DEFAULT_CONFIG)
-
-    for key, value in raw_config.items():
-        if key in {"delay_seconds", "viewport"} and isinstance(value, dict):
-            config[key].update(value)
-        else:
-            config[key] = value
-
-    keywords = normalize_keywords(config)
+    for k in raw_keywords:
+        text = clean_text(k)
+        if text and text not in seen:
+            seen.add(text)
+            keywords.append(text)
+    
     if not keywords:
-        raise ValueError("请在 config.json 中配置 keywords（至少 1 个关键词）")
+        raise ValueError("请在 .env 中配置 KEYWORDS（至少 1 个关键词）")
 
-    regions = normalize_regions(config)
+    raw_regions = os.getenv("REGIONS", "").split(",")
+    regions = []
+    seen = set()
+    for r in raw_regions:
+        text = clean_text(r)
+        if text:
+            normalized = text[:-1] if text.endswith("市") else text
+            if normalized not in seen:
+                seen.add(normalized)
+                regions.append(normalized)
+
     if not regions:
-        raise ValueError("地区解析为空，请检查 regions/default_regions")
+        raw_default = os.getenv("DEFAULT_REGIONS", "北京,上海,广州,深圳,杭州").split(",")
+        for r in raw_default:
+            text = clean_text(r)
+            if text:
+                normalized = text[:-1] if text.endswith("市") else text
+                if normalized not in seen:
+                    seen.add(normalized)
+                    regions.append(normalized)
 
-    base_dir = config_path.parent
-    output_dir_raw = clean_text(str(config.get("output_dir", "output"))) or "output"
+    if not regions:
+        raise ValueError("地区解析为空，请检查 .env 中的 REGIONS/DEFAULT_REGIONS")
+
+    base_dir = env_path.parent
+    output_dir_raw = clean_text(os.getenv("OUTPUT_DIR", "output")) or "output"
     output_dir_path = Path(output_dir_raw)
     if not output_dir_path.is_absolute():
         output_dir_path = (base_dir / output_dir_path).resolve()
     output_dir_path.mkdir(parents=True, exist_ok=True)
+    
+    def parse_delay_env(env_val: str, default: tuple[float, float]) -> tuple[float, float]:
+        if not env_val:
+            return default
+        parts = env_val.split(",")
+        if len(parts) != 2:
+            return default
+        try:
+            low, high = float(parts[0]), float(parts[1])
+            if low > high:
+                low, high = high, low
+            return low, high
+        except ValueError:
+            return default
 
-    delay_config = config.get("delay_seconds", {})
-    if not isinstance(delay_config, dict):
-        delay_config = {}
-
-    return {
+    settings = {
         "keywords": keywords,
         "regions": regions,
-        "max_pages_per_region": parse_positive_int(
-            config.get("max_pages_per_region"),
-            DEFAULT_CONFIG["max_pages_per_region"],
-        ),
-        "max_empty_page_retries": parse_positive_int(
-            config.get("max_empty_page_retries"),
-            DEFAULT_CONFIG["max_empty_page_retries"],
-        ),
-        "headless": parse_bool(config.get("headless"), False),
-        "user_agent": clean_text(str(config.get("user_agent", DEFAULT_CONFIG["user_agent"])))
-        or DEFAULT_CONFIG["user_agent"],
+        "max_pages_per_region": parse_positive_int(os.getenv("MAX_PAGES_PER_REGION", "5"), 5),
+        "max_empty_page_retries": parse_positive_int(os.getenv("MAX_EMPTY_PAGE_RETRIES", "2"), 2),
+        "headless": parse_bool(os.getenv("HEADLESS", "false"), False),
+        "user_agent": clean_text(os.getenv("USER_AGENT", DEFAULT_CONFIG["user_agent"])) or DEFAULT_CONFIG["user_agent"],
         "viewport": {
-            "width": parse_positive_int(
-                config.get("viewport", {}).get("width"),
-                DEFAULT_CONFIG["viewport"]["width"],
-            ),
-            "height": parse_positive_int(
-                config.get("viewport", {}).get("height"),
-                DEFAULT_CONFIG["viewport"]["height"],
-            ),
+            "width": parse_positive_int(os.getenv("VIEWPORT_WIDTH", "1400"), 1400),
+            "height": parse_positive_int(os.getenv("VIEWPORT_HEIGHT", "900"), 900),
         },
         "delays": {
-            "after_open_search": parse_delay_range(delay_config, "after_open_search", (2.5, 4.0)),
-            "between_pages": parse_delay_range(delay_config, "between_pages", (1.8, 3.0)),
-            "retry_reload": parse_delay_range(delay_config, "retry_reload", (4.0, 6.0)),
+            "after_open_search": parse_delay_env(os.getenv("DELAY_AFTER_OPEN_SEARCH", ""), (2.5, 4.0)),
+            "between_pages": parse_delay_env(os.getenv("DELAY_BETWEEN_PAGES", ""), (1.8, 3.0)),
+            "retry_reload": parse_delay_env(os.getenv("DELAY_RETRY_RELOAD", ""), (4.0, 6.0)),
         },
         "output_dir": output_dir_path,
     }
+    return settings
 
 
 async def search_keyword_in_city(
@@ -767,12 +708,12 @@ def save_jobs_by_keyword(jobs: list[dict], output_dir: Path, keyword: str) -> di
     }
 
 
-def print_config_summary(settings: dict[str, Any], config_path: Path) -> None:
+def print_config_summary(settings: dict[str, Any], env_path: Path) -> None:
     """打印本次任务配置摘要。"""
     keywords = "、".join(settings["keywords"])
     regions = "、".join(settings["regions"])
 
-    print(f"已加载配置：{config_path}")
+    print(f"已加载配置：{env_path}")
     print(f"关键词：{keywords}")
     print(f"地区：{regions}")
     print(f"每个地区最大页数：{settings['max_pages_per_region']}")
@@ -782,17 +723,17 @@ def print_config_summary(settings: dict[str, Any], config_path: Path) -> None:
 
 async def main() -> None:
     script_dir = Path(__file__).resolve().parent
-    config_path = script_dir / CONFIG_FILE_NAME
+    env_path = script_dir / ENV_FILE_NAME
 
     try:
-        settings = load_config(config_path)
+        settings = load_env_config(env_path)
     except Exception as exc:
         print(f"配置加载失败：{exc}")
-        print(f"请检查 {config_path} 后重试。")
+        print(f"请检查 {env_path} 后重试。")
         return
 
     print("提示：程序将自动打开浏览器抓取智联招聘数据。")
-    print_config_summary(settings, config_path)
+    print_config_summary(settings, env_path)
 
     total_tasks = len(settings["keywords"]) * len(settings["regions"])
     current_task = 0
