@@ -39,7 +39,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "output_dir": "output",
 }
 
-OUTPUT_COLUMNS = ["搜索关键词", "抓取地区", "招聘单位名称", "岗位名称", "能力描述"]
+OUTPUT_COLUMNS = ["招聘单位名称", "岗位名称", "能力描述"]
 
 
 async def human_sleep(min_s: float = 1.5, max_s: float = 3.5) -> None:
@@ -52,6 +52,37 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_city_name(raw_city: str) -> str:
+    """归一化城市名称，兼容“北京市”“北京·朝阳”等格式。"""
+    city = clean_text(raw_city)
+    if not city:
+        return ""
+
+    for sep in ["·", "-", "/", "|", " "]:
+        if sep in city:
+            city = city.split(sep, 1)[0]
+
+    city = city.replace("市", "")
+    return clean_text(city)
+
+
+def is_job_in_target_city(job_city: str, target_city: str) -> bool:
+    """判断岗位城市是否与目标城市一致。"""
+    normalized_target = normalize_city_name(target_city)
+    normalized_job_city = normalize_city_name(job_city)
+
+    if not normalized_target:
+        return True
+    if not normalized_job_city:
+        return False
+
+    return (
+        normalized_job_city == normalized_target
+        or normalized_job_city.startswith(normalized_target)
+        or normalized_target.startswith(normalized_job_city)
+    )
 
 
 def extract_initial_state(html: str) -> dict:
@@ -139,6 +170,7 @@ def parse_jobs_from_state(state: dict) -> list[dict]:
                 "招聘单位名称": company_name,
                 "岗位名称": job_name,
                 "能力描述": ability_desc,
+                "__工作城市": work_city,
             }
         )
 
@@ -195,6 +227,7 @@ def parse_jobs_from_dom(html: str) -> list[dict]:
                 "招聘单位名称": company_name,
                 "岗位名称": job_name,
                 "能力描述": ability_desc,
+                "__工作城市": location,
             }
         )
 
@@ -437,13 +470,7 @@ async def search_keyword_in_city(
         state.get("queryParams", {}).get("keyWords", "")
         or state.get("displayParams", {}).get("keyWords", "")
     )
-    page_city_name = clean_text(
-        state.get("queryParams", {}).get("cityCode", "")
-        or state.get("displayParams", {}).get("cityCode", "")
-    )
-    expected_city = clean_text(city_name[:-1] if city_name.endswith("市") else city_name)
-    actual_city = clean_text(page_city_name[:-1] if page_city_name.endswith("市") else page_city_name)
-    if page_keyword == clean_text(keyword) and actual_city == expected_city:
+    if page_keyword == clean_text(keyword):
         return
 
     try:
@@ -502,15 +529,11 @@ async def crawl_zhaopin(
                 html = await page.content()
 
                 state = extract_initial_state(html)
-                page_jobs = parse_jobs_from_state(state)
-                if not page_jobs:
-                    page_jobs = parse_jobs_from_dom(html)
+                raw_page_jobs = parse_jobs_from_state(state)
+                if not raw_page_jobs:
+                    raw_page_jobs = parse_jobs_from_dom(html)
 
-                for item in page_jobs:
-                    item["搜索关键词"] = keyword
-                    item["抓取地区"] = city
-
-                if not page_jobs:
+                if not raw_page_jobs:
                     empty_retry_count += 1
                     if empty_retry_count <= settings["max_empty_page_retries"]:
                         if looks_like_verification_page(html):
@@ -536,11 +559,23 @@ async def crawl_zhaopin(
 
                 empty_retry_count = 0
 
+                page_jobs = []
+                filtered_other_city = 0
+                for item in raw_page_jobs:
+                    job_city = clean_text(str(item.get("__工作城市", "")))
+                    if not is_job_in_target_city(job_city=job_city, target_city=city):
+                        filtered_other_city += 1
+                        continue
+                    page_jobs.append(item)
+
+                if filtered_other_city:
+                    print(
+                        f"第 {current_page} 页已过滤 {filtered_other_city} 条非目标城市岗位（目标城市：{city}）。"
+                    )
+
                 new_count = 0
                 for item in page_jobs:
                     key = (
-                        item["抓取地区"],
-                        item["搜索关键词"],
                         item["招聘单位名称"],
                         item["岗位名称"],
                     )
@@ -551,7 +586,7 @@ async def crawl_zhaopin(
                     new_count += 1
 
                 print(
-                    f"第 {current_page} 页：解析 {len(page_jobs)} 条，"
+                    f"第 {current_page} 页：解析 {len(raw_page_jobs)} 条，城市匹配 {len(page_jobs)} 条，"
                     f"新增 {new_count} 条（累计 {len(jobs)} 条）"
                 )
 
@@ -670,16 +705,6 @@ def merge_job_records(
 
         current = merged_map[key]
         changed = False
-
-        merged_keyword = merge_distinct_text(current["搜索关键词"], normalized["搜索关键词"])
-        if merged_keyword != current["搜索关键词"]:
-            current["搜索关键词"] = merged_keyword
-            changed = True
-
-        merged_region = merge_distinct_text(current["抓取地区"], normalized["抓取地区"])
-        if merged_region != current["抓取地区"]:
-            current["抓取地区"] = merged_region
-            changed = True
 
         if normalized["能力描述"] and normalized["能力描述"] != current["能力描述"]:
             current["能力描述"] = normalized["能力描述"]
@@ -817,7 +842,7 @@ async def main() -> None:
         f"更新 {updated_total} 条。"
     )
     print(f"输出目录：{settings['output_dir']}")
-    print("表格列：序号 | 搜索关键词 | 抓取地区 | 招聘单位名称 | 岗位名称 | 能力描述")
+    print("表格列：序号 | 招聘单位名称 | 岗位名称 | 能力描述")
     if saved_files:
         print("文件列表：")
         for path in saved_files:
