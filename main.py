@@ -1,0 +1,654 @@
+import asyncio
+import copy
+import json
+import random
+import re
+import urllib.parse
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from bs4 import BeautifulSoup
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
+
+
+# 智联搜索入口。关键词通过 query 参数传入，由站点自动跳转到对应 kw 加密路径。
+ZHAOPIN_SEARCH_URL = "https://www.zhaopin.com/sou/"
+
+CONFIG_FILE_NAME = "config.json"
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "keywords": ["数据分析"],
+    "regions": [],
+    "default_regions": ["北京", "上海", "广州", "深圳", "杭州"],
+    "max_pages_per_region": 5,
+    "max_empty_page_retries": 2,
+    "headless": False,
+    "user_agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "viewport": {"width": 1400, "height": 900},
+    "delay_seconds": {
+        "after_open_search": [2.5, 4.0],
+        "between_pages": [1.8, 3.0],
+        "retry_reload": [4.0, 6.0],
+    },
+    "output_dir": ".",
+    "output_filename_prefix": "zhaopin",
+}
+
+
+async def human_sleep(min_s: float = 1.5, max_s: float = 3.5) -> None:
+    """随机等待，降低自动化行为特征。"""
+    await asyncio.sleep(random.uniform(min_s, max_s))
+
+
+def clean_text(text: str) -> str:
+    """压缩空白并去除首尾空格。"""
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_initial_state(html: str) -> dict:
+    """从页面 HTML 中提取 __INITIAL_STATE__ JSON。"""
+    match = re.search(r"__INITIAL_STATE__=(\{.*?\})</script>", html, re.S)
+    if not match:
+        return {}
+
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return {}
+
+
+def build_search_url(keyword: str, city_name: str, page: int = 1) -> str:
+    """构造智联搜索 URL，使用城市名称直接搜索（无需 code）。"""
+    params = {"jl": city_name, "kw": keyword, "p": str(page)}
+    return f"{ZHAOPIN_SEARCH_URL}?{urllib.parse.urlencode(params)}"
+
+
+def build_ability_desc(
+    salary: str,
+    location: str,
+    experience: str,
+    education: str,
+    tags: list[str],
+    summary: str,
+) -> str:
+    """拼接输出字段中的“能力描述”。"""
+    parts = []
+    if salary:
+        parts.append(f"薪资：{salary}")
+    if location:
+        parts.append(f"地点：{location}")
+    if experience:
+        parts.append(f"经验：{experience}")
+    if education:
+        parts.append(f"学历：{education}")
+    if tags:
+        parts.append("技能标签：" + " / ".join(tags[:10]))
+    if summary:
+        summary = clean_text(summary)
+        if len(summary) > 420:
+            summary = summary[:420] + "..."
+        parts.append("岗位摘要：" + summary)
+
+    if not parts:
+        return "（暂无能力描述）"
+    return "；".join(parts)
+
+
+def parse_jobs_from_state(state: dict) -> list[dict]:
+    """优先从 __INITIAL_STATE__.positionList 解析岗位。"""
+    jobs = []
+    for item in state.get("positionList", []):
+        company_name = clean_text(item.get("companyName", "")) or "未知单位"
+        job_name = clean_text(item.get("name", "")) or "未知岗位"
+
+        salary = clean_text(item.get("salary60", ""))
+        work_city = clean_text(item.get("workCity", ""))
+        district = clean_text(item.get("cityDistrict", ""))
+        location = "·".join([x for x in [work_city, district] if x])
+
+        experience = clean_text(item.get("workingExp", ""))
+        education = clean_text(item.get("education", ""))
+
+        tags = [
+            clean_text(tag.get("name", ""))
+            for tag in item.get("jobSkillTags", [])
+            if clean_text(tag.get("name", ""))
+        ]
+        summary = item.get("jobSummary", "")
+
+        ability_desc = build_ability_desc(
+            salary=salary,
+            location=location,
+            experience=experience,
+            education=education,
+            tags=tags,
+            summary=summary,
+        )
+
+        jobs.append(
+            {
+                "招聘单位名称": company_name,
+                "岗位名称": job_name,
+                "能力描述": ability_desc,
+            }
+        )
+
+    return jobs
+
+
+def parse_jobs_from_dom(html: str) -> list[dict]:
+    """当 __INITIAL_STATE__ 不可用时，使用 DOM 结构兜底解析。"""
+    soup = BeautifulSoup(html, "html.parser")
+    cards = soup.select("div.joblist-box__item")
+    if not cards:
+        return []
+
+    jobs = []
+    for card in cards:
+        title_tag = card.select_one("a.jobinfo__name")
+        company_tag = card.select_one("a.companyinfo__name")
+        salary_tag = card.select_one("p.jobinfo__salary")
+
+        job_name = clean_text(title_tag.get_text()) if title_tag else "未知岗位"
+        company_name = clean_text(company_tag.get_text()) if company_tag else "未知单位"
+        salary = clean_text(salary_tag.get_text()) if salary_tag else ""
+
+        info_items = card.select("div.jobinfo__other-info-item")
+        location = ""
+        experience = ""
+        education = ""
+        if info_items:
+            first_loc = info_items[0].select_one("span")
+            if first_loc:
+                location = clean_text(first_loc.get_text())
+            if len(info_items) > 1:
+                experience = clean_text(info_items[1].get_text())
+            if len(info_items) > 2:
+                education = clean_text(info_items[2].get_text())
+
+        tags = [
+            clean_text(t.get_text())
+            for t in card.select("div.jobinfo__tag div.joblist-box__item-tag")
+            if clean_text(t.get_text())
+        ]
+
+        ability_desc = build_ability_desc(
+            salary=salary,
+            location=location,
+            experience=experience,
+            education=education,
+            tags=tags,
+            summary="",
+        )
+
+        jobs.append(
+            {
+                "招聘单位名称": company_name,
+                "岗位名称": job_name,
+                "能力描述": ability_desc,
+            }
+        )
+
+    return jobs
+
+
+def extract_next_page_url(html: str, base_url: str = "https://www.zhaopin.com") -> str:
+    """提取“下一页”链接。"""
+    soup = BeautifulSoup(html, "html.parser")
+    for anchor in soup.select("a.soupager__btn"):
+        text = clean_text(anchor.get_text())
+        if text != "下一页":
+            continue
+
+        href = anchor.get("href", "")
+        if not href:
+            return ""
+        return urllib.parse.urljoin(base_url, href)
+
+    return ""
+
+
+def looks_like_verification_page(html: str) -> bool:
+    """判断是否进入了验证页（使用强特征，避免误判普通职位页）。"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    title_text = clean_text(soup.title.get_text()) if soup.title else ""
+    if any(sig in title_text for sig in ["安全验证", "行为验证", "验证码"]):
+        return True
+
+    # 腾讯验证码通常会以内嵌 iframe 或容器出现。
+    captcha_nodes = soup.select(
+        "iframe[src*='captcha.eo.qq.com'], "
+        "iframe[src*='geetest'], "
+        "div[id*='captcha'], "
+        "div[class*='captcha'], "
+        "div[id*='geetest'], "
+        "div[class*='geetest']"
+    )
+    if captcha_nodes:
+        return True
+
+    # 普通职位页至少会有 root 容器或岗位卡片；两者都缺失时更可能是拦截页。
+    has_root = bool(soup.select_one("#root"))
+    has_cards = bool(soup.select("div.joblist-box__item"))
+    if not has_root and not has_cards:
+        body_text = soup.get_text(" ", strip=True)
+        if any(sig in body_text for sig in ["请完成验证", "验证后继续", "点击完成验证"]):
+            return True
+
+    return False
+
+
+async def search_keyword(page, keyword: str) -> None:
+    """兼容旧调用（未指定城市时默认广州）。"""
+    await search_keyword_in_city(page, keyword=keyword, city_name="广州", delay=(2.5, 4.0))
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    """解析布尔配置，支持字符串和数字。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return default
+
+
+def parse_positive_int(value: Any, default: int) -> int:
+    """解析正整数配置。"""
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_delay_range(delays: dict[str, Any], key: str, default: tuple[float, float]) -> tuple[float, float]:
+    """解析延时范围配置。"""
+    value = delays.get(key, default)
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return default
+
+    try:
+        low = float(value[0])
+        high = float(value[1])
+    except (TypeError, ValueError):
+        return default
+
+    if low <= 0 or high <= 0:
+        return default
+    if low > high:
+        low, high = high, low
+    return low, high
+
+
+def normalize_keywords(config: dict[str, Any]) -> list[str]:
+    """从配置中归一化关键词列表。"""
+    raw_keywords = config.get("keywords", [])
+    if isinstance(raw_keywords, str):
+        raw_keywords = [raw_keywords]
+    if not isinstance(raw_keywords, list):
+        raw_keywords = []
+
+    # 兼容旧写法 keyword: "..."
+    legacy_keyword = config.get("keyword")
+    if isinstance(legacy_keyword, str) and legacy_keyword.strip():
+        raw_keywords.append(legacy_keyword)
+
+    result = []
+    seen = set()
+    for item in raw_keywords:
+        text = clean_text(str(item))
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+
+    return result
+
+
+def normalize_regions(config: dict[str, Any]) -> list[str]:
+    """解析地区配置，仅使用城市名称；为空时使用默认北上广深杭。"""
+    raw_regions = config.get("regions", [])
+    if isinstance(raw_regions, str):
+        raw_regions = [raw_regions]
+    if not isinstance(raw_regions, list):
+        raw_regions = []
+
+    if not raw_regions:
+        defaults = config.get("default_regions", [])
+        if isinstance(defaults, str):
+            defaults = [defaults]
+        if isinstance(defaults, list):
+            raw_regions = defaults
+
+    resolved = []
+    seen = set()
+    for region in raw_regions:
+        city_name = clean_text(str(region))
+        if not city_name:
+            continue
+
+        normalized = city_name[:-1] if city_name.endswith("市") else city_name
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        resolved.append(normalized)
+
+    return resolved
+
+
+def load_config(config_path: Path) -> dict[str, Any]:
+    """加载并归一化 config.json。"""
+    if not config_path.exists():
+        raise FileNotFoundError(f"未找到配置文件：{config_path}")
+
+    with config_path.open("r", encoding="utf-8") as f:
+        raw_config = json.load(f)
+
+    if not isinstance(raw_config, dict):
+        raise ValueError("config.json 顶层必须是 JSON 对象")
+
+    config = copy.deepcopy(DEFAULT_CONFIG)
+
+    for key, value in raw_config.items():
+        if key in {"delay_seconds", "viewport"} and isinstance(value, dict):
+            config[key].update(value)
+        else:
+            config[key] = value
+
+    keywords = normalize_keywords(config)
+    if not keywords:
+        raise ValueError("请在 config.json 中配置 keywords（至少 1 个关键词）")
+
+    regions = normalize_regions(config)
+    if not regions:
+        raise ValueError("地区解析为空，请检查 regions/default_regions")
+
+    base_dir = config_path.parent
+    output_dir_raw = clean_text(str(config.get("output_dir", "."))) or "."
+    output_dir_path = Path(output_dir_raw)
+    if not output_dir_path.is_absolute():
+        output_dir_path = (base_dir / output_dir_path).resolve()
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    prefix = clean_text(str(config.get("output_filename_prefix", "zhaopin"))) or "zhaopin"
+    prefix = re.sub(r"[\\/:*?\"<>|]", "_", prefix)
+
+    delay_config = config.get("delay_seconds", {})
+    if not isinstance(delay_config, dict):
+        delay_config = {}
+
+    return {
+        "keywords": keywords,
+        "regions": regions,
+        "max_pages_per_region": parse_positive_int(
+            config.get("max_pages_per_region"),
+            DEFAULT_CONFIG["max_pages_per_region"],
+        ),
+        "max_empty_page_retries": parse_positive_int(
+            config.get("max_empty_page_retries"),
+            DEFAULT_CONFIG["max_empty_page_retries"],
+        ),
+        "headless": parse_bool(config.get("headless"), False),
+        "user_agent": clean_text(str(config.get("user_agent", DEFAULT_CONFIG["user_agent"])))
+        or DEFAULT_CONFIG["user_agent"],
+        "viewport": {
+            "width": parse_positive_int(
+                config.get("viewport", {}).get("width"),
+                DEFAULT_CONFIG["viewport"]["width"],
+            ),
+            "height": parse_positive_int(
+                config.get("viewport", {}).get("height"),
+                DEFAULT_CONFIG["viewport"]["height"],
+            ),
+        },
+        "delays": {
+            "after_open_search": parse_delay_range(delay_config, "after_open_search", (2.5, 4.0)),
+            "between_pages": parse_delay_range(delay_config, "between_pages", (1.8, 3.0)),
+            "retry_reload": parse_delay_range(delay_config, "retry_reload", (4.0, 6.0)),
+        },
+        "output_dir": output_dir_path,
+        "output_filename_prefix": prefix,
+    }
+
+
+async def search_keyword_in_city(
+    page,
+    keyword: str,
+    city_name: str,
+    delay: tuple[float, float],
+) -> None:
+    """按关键词 + 城市名称直达搜索页，确保输入岗位和地区同时生效。"""
+    target_url = build_search_url(keyword=keyword, city_name=city_name, page=1)
+    await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+    await human_sleep(*delay)
+
+    # 校验页面状态中的关键词是否与输入一致；若不一致，尝试输入框兜底。
+    html = await page.content()
+    state = extract_initial_state(html)
+    page_keyword = clean_text(
+        state.get("queryParams", {}).get("keyWords", "")
+        or state.get("displayParams", {}).get("keyWords", "")
+    )
+    page_city_name = clean_text(
+        state.get("queryParams", {}).get("cityCode", "")
+        or state.get("displayParams", {}).get("cityCode", "")
+    )
+    expected_city = clean_text(city_name[:-1] if city_name.endswith("市") else city_name)
+    actual_city = clean_text(page_city_name[:-1] if page_city_name.endswith("市") else page_city_name)
+    if page_keyword == clean_text(keyword) and actual_city == expected_city:
+        return
+
+    try:
+        await page.wait_for_selector("input.query-search__content-input", timeout=20000)
+        search_input = page.locator("input.query-search__content-input:visible").first
+        await search_input.click()
+        await search_input.fill("")
+        await search_input.fill(keyword)
+
+        try:
+            await page.click("button.query-search__content-button", timeout=10000)
+        except PlaywrightTimeoutError:
+            await search_input.press("Enter")
+
+        await human_sleep(*delay)
+    except PlaywrightTimeoutError:
+        # 页面结构异常时交由后续解析逻辑处理。
+        return
+
+
+async def crawl_zhaopin(
+    keyword: str,
+    city: str,
+    settings: dict[str, Any],
+) -> list[dict]:
+    """爬取智联招聘岗位数据并返回列表。"""
+    jobs = []
+    seen = set()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=settings["headless"])
+        context = await browser.new_context(
+            ignore_https_errors=True,
+            user_agent=settings["user_agent"],
+            viewport=settings["viewport"],
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+
+        page = await context.new_page()
+
+        try:
+            print(f"开始抓取：关键词={keyword}，地区={city}")
+            await search_keyword_in_city(
+                page,
+                keyword=keyword,
+                city_name=city,
+                delay=settings["delays"]["after_open_search"],
+            )
+
+            current_page = 1
+            empty_retry_count = 0
+            while current_page <= settings["max_pages_per_region"]:
+                await human_sleep(*settings["delays"]["between_pages"])
+                html = await page.content()
+
+                state = extract_initial_state(html)
+                page_jobs = parse_jobs_from_state(state)
+                if not page_jobs:
+                    page_jobs = parse_jobs_from_dom(html)
+
+                for item in page_jobs:
+                    item["搜索关键词"] = keyword
+                    item["抓取地区"] = city
+
+                if not page_jobs:
+                    empty_retry_count += 1
+                    if empty_retry_count <= settings["max_empty_page_retries"]:
+                        if looks_like_verification_page(html):
+                            print(
+                                f"第 {current_page} 页疑似触发验证，"
+                                f"自动重试（{empty_retry_count}/{settings['max_empty_page_retries']}）..."
+                            )
+                        else:
+                            print(
+                                f"第 {current_page} 页暂未解析到岗位，"
+                                f"自动重试（{empty_retry_count}/{settings['max_empty_page_retries']}）..."
+                            )
+
+                        await human_sleep(*settings["delays"]["retry_reload"])
+                        await page.reload(wait_until="domcontentloaded", timeout=90000)
+                        continue
+
+                    print(
+                        f"第 {current_page} 页连续 {settings['max_empty_page_retries']} 次未解析到岗位，"
+                        "已停止继续翻页，保留已抓取数据。"
+                    )
+                    break
+
+                empty_retry_count = 0
+
+                new_count = 0
+                for item in page_jobs:
+                    key = (
+                        item["抓取地区"],
+                        item["搜索关键词"],
+                        item["招聘单位名称"],
+                        item["岗位名称"],
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    jobs.append(item)
+                    new_count += 1
+
+                print(
+                    f"第 {current_page} 页：解析 {len(page_jobs)} 条，"
+                    f"新增 {new_count} 条（累计 {len(jobs)} 条）"
+                )
+
+                if current_page >= settings["max_pages_per_region"]:
+                    break
+
+                # 优先使用 query 参数构造下一页 URL，减少对页面内加密路径的依赖。
+                next_page = current_page + 1
+                next_url = build_search_url(keyword=keyword, city_name=city, page=next_page)
+
+                # 当页面确认没有下一页时停止。
+                if not extract_next_page_url(html):
+                    print("已到最后一页。")
+                    break
+
+                await page.goto(next_url, wait_until="domcontentloaded", timeout=90000)
+                current_page = next_page
+
+        finally:
+            await context.close()
+            await browser.close()
+
+    return jobs
+
+
+def save_to_excel(jobs: list[dict], output_dir: Path, filename_prefix: str) -> str:
+    """保存抓取结果为 Excel。"""
+    if not jobs:
+        return ""
+
+    df = pd.DataFrame(jobs)
+    df.insert(0, "序号", range(1, len(df) + 1))
+
+    preferred_columns = ["序号", "搜索关键词", "抓取地区", "招聘单位名称", "岗位名称", "能力描述"]
+    existing_preferred = [col for col in preferred_columns if col in df.columns]
+    other_columns = [col for col in df.columns if col not in existing_preferred]
+    df = df[existing_preferred + other_columns]
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{filename_prefix}_岗位信息_{timestamp}.xlsx"
+    output_path = output_dir / filename
+    df.to_excel(output_path, index=False)
+    return str(output_path)
+
+
+def print_config_summary(settings: dict[str, Any], config_path: Path) -> None:
+    """打印本次任务配置摘要。"""
+    keywords = "、".join(settings["keywords"])
+    regions = "、".join(settings["regions"])
+
+    print(f"已加载配置：{config_path}")
+    print(f"关键词：{keywords}")
+    print(f"地区：{regions}")
+    print(f"每个地区最大页数：{settings['max_pages_per_region']}")
+    print(f"浏览器无头模式：{settings['headless']}")
+
+async def main() -> None:
+    script_dir = Path(__file__).resolve().parent
+    config_path = script_dir / CONFIG_FILE_NAME
+
+    try:
+        settings = load_config(config_path)
+    except Exception as exc:
+        print(f"配置加载失败：{exc}")
+        print(f"请检查 {config_path} 后重试。")
+        return
+
+    print("提示：程序将自动打开浏览器抓取智联招聘数据。")
+    print_config_summary(settings, config_path)
+
+    all_jobs = []
+    for keyword in settings["keywords"]:
+        for city in settings["regions"]:
+            region_jobs = await crawl_zhaopin(
+                keyword=keyword,
+                city=city,
+                settings=settings,
+            )
+            all_jobs.extend(region_jobs)
+
+    if not all_jobs:
+        print("未抓取到数据，请稍后重试或检查配置。")
+        return
+
+    filename = save_to_excel(
+        all_jobs,
+        output_dir=settings["output_dir"],
+        filename_prefix=settings["output_filename_prefix"],
+    )
+    if filename:
+        print(f"\n爬取完成！共 {len(all_jobs)} 条数据，已保存到：{filename}")
+        print("表格列：序号 | 搜索关键词 | 抓取地区 | 招聘单位名称 | 岗位名称 | 能力描述")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
