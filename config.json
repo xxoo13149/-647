@@ -1,0 +1,33 @@
+{
+  "keywords": [
+    "大模型算法工程师",
+    "数据分析师",
+    "软件开发"
+  ],
+  "regions": [
+    "北京",
+    "上海",
+    "深圳"
+  ],
+  "default_regions": [
+    "北京",
+    "上海",
+    "广州",
+    "深圳",
+    "杭州"
+  ],
+  "max_pages_per_region": 5,
+  "max_empty_page_retries": 2,
+  "headless": true,
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "viewport": {
+    "width": 1400,
+    "height": 900
+  },
+  "delay_seconds": {
+    "after_open_search": [2.5, 4.0],
+    "between_pages": [1.8, 3.0],
+    "retry_reload": [4.0, 6.0]
+  },
+  "output_dir": "output"
+}

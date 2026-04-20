@@ -4,7 +4,6 @@ import json
 import random
 import re
 import urllib.parse
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,9 +36,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "between_pages": [1.8, 3.0],
         "retry_reload": [4.0, 6.0],
     },
-    "output_dir": ".",
-    "output_filename_prefix": "zhaopin",
+    "output_dir": "output",
 }
+
+OUTPUT_COLUMNS = ["搜索关键词", "抓取地区", "招聘单位名称", "岗位名称", "能力描述"]
 
 
 async def human_sleep(min_s: float = 1.5, max_s: float = 3.5) -> None:
@@ -376,14 +376,11 @@ def load_config(config_path: Path) -> dict[str, Any]:
         raise ValueError("地区解析为空，请检查 regions/default_regions")
 
     base_dir = config_path.parent
-    output_dir_raw = clean_text(str(config.get("output_dir", "."))) or "."
+    output_dir_raw = clean_text(str(config.get("output_dir", "output"))) or "output"
     output_dir_path = Path(output_dir_raw)
     if not output_dir_path.is_absolute():
         output_dir_path = (base_dir / output_dir_path).resolve()
     output_dir_path.mkdir(parents=True, exist_ok=True)
-
-    prefix = clean_text(str(config.get("output_filename_prefix", "zhaopin"))) or "zhaopin"
-    prefix = re.sub(r"[\\/:*?\"<>|]", "_", prefix)
 
     delay_config = config.get("delay_seconds", {})
     if not isinstance(delay_config, dict):
@@ -419,7 +416,6 @@ def load_config(config_path: Path) -> dict[str, Any]:
             "retry_reload": parse_delay_range(delay_config, "retry_reload", (4.0, 6.0)),
         },
         "output_dir": output_dir_path,
-        "output_filename_prefix": prefix,
     }
 
 
@@ -581,24 +577,169 @@ async def crawl_zhaopin(
     return jobs
 
 
-def save_to_excel(jobs: list[dict], output_dir: Path, filename_prefix: str) -> str:
-    """保存抓取结果为 Excel。"""
-    if not jobs:
-        return ""
+def sanitize_filename(name: str, fallback: str = "未知岗位") -> str:
+    """清理非法文件名字符，确保可写入本地文件系统。"""
+    sanitized = re.sub(r"[\\/:*?\"<>|]", "_", clean_text(name))
+    sanitized = sanitized.strip().rstrip(".")
+    return sanitized or fallback
 
-    df = pd.DataFrame(jobs)
+
+def merge_distinct_text(current_value: str, new_value: str) -> str:
+    """合并“、”分隔的文本，去重并保留顺序。"""
+    merged = []
+    seen = set()
+
+    for raw in (current_value, new_value):
+        text = clean_text(raw)
+        if not text:
+            continue
+
+        for part in text.split("、"):
+            item = clean_text(part)
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            merged.append(item)
+
+    return "、".join(merged)
+
+
+def normalize_job_record(item: dict[str, Any]) -> dict[str, str]:
+    """标准化岗位记录字段。"""
+    record = {column: clean_text(str(item.get(column, ""))) for column in OUTPUT_COLUMNS}
+
+    if not record["招聘单位名称"]:
+        record["招聘单位名称"] = "未知单位"
+    if not record["岗位名称"]:
+        record["岗位名称"] = "未知岗位"
+
+    return record
+
+
+def load_existing_job_records(file_path: Path) -> list[dict[str, str]]:
+    """读取已存在的岗位 Excel 记录。"""
+    if not file_path.exists():
+        return []
+
+    try:
+        df = pd.read_excel(file_path, dtype=str, engine="openpyxl").fillna("")
+    except Exception as exc:
+        print(f"警告：读取现有文件失败，将以新数据重建：{file_path}，原因：{exc}")
+        return []
+
+    if df.empty:
+        return []
+
+    if "序号" in df.columns:
+        df = df.drop(columns=["序号"])
+
+    records = []
+    for _, row in df.iterrows():
+        records.append(normalize_job_record(row.to_dict()))
+    return records
+
+
+def merge_job_records(
+    existing_records: list[dict[str, str]],
+    new_records: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], int, int]:
+    """按“公司 + 岗位”去重合并。描述变化则更新，不存在则追加。"""
+    merged_map: dict[tuple[str, str], dict[str, str]] = {}
+    ordered_keys: list[tuple[str, str]] = []
+
+    for record in existing_records:
+        normalized = normalize_job_record(record)
+        key = (normalized["招聘单位名称"], normalized["岗位名称"])
+        if key in merged_map:
+            continue
+        merged_map[key] = normalized
+        ordered_keys.append(key)
+
+    appended_count = 0
+    updated_count = 0
+
+    for record in new_records:
+        normalized = normalize_job_record(record)
+        key = (normalized["招聘单位名称"], normalized["岗位名称"])
+
+        if key not in merged_map:
+            merged_map[key] = normalized
+            ordered_keys.append(key)
+            appended_count += 1
+            continue
+
+        current = merged_map[key]
+        changed = False
+
+        merged_keyword = merge_distinct_text(current["搜索关键词"], normalized["搜索关键词"])
+        if merged_keyword != current["搜索关键词"]:
+            current["搜索关键词"] = merged_keyword
+            changed = True
+
+        merged_region = merge_distinct_text(current["抓取地区"], normalized["抓取地区"])
+        if merged_region != current["抓取地区"]:
+            current["抓取地区"] = merged_region
+            changed = True
+
+        if normalized["能力描述"] and normalized["能力描述"] != current["能力描述"]:
+            current["能力描述"] = normalized["能力描述"]
+            changed = True
+
+        if changed:
+            updated_count += 1
+
+    merged_records = [merged_map[key] for key in ordered_keys]
+    return merged_records, appended_count, updated_count
+
+
+def write_job_records_to_excel(file_path: Path, records: list[dict[str, str]]) -> None:
+    """将岗位记录写入 Excel，序号每次按当前文件重排。"""
+    df = pd.DataFrame(records)
+
+    for column in OUTPUT_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+
+    df = df[OUTPUT_COLUMNS]
     df.insert(0, "序号", range(1, len(df) + 1))
+    df.to_excel(file_path, index=False, engine="openpyxl")
 
-    preferred_columns = ["序号", "搜索关键词", "抓取地区", "招聘单位名称", "岗位名称", "能力描述"]
-    existing_preferred = [col for col in preferred_columns if col in df.columns]
-    other_columns = [col for col in df.columns if col not in existing_preferred]
-    df = df[existing_preferred + other_columns]
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{filename_prefix}_岗位信息_{timestamp}.xlsx"
-    output_path = output_dir / filename
-    df.to_excel(output_path, index=False)
-    return str(output_path)
+def save_jobs_by_keyword(jobs: list[dict], output_dir: Path, keyword: str) -> dict[str, Any]:
+    """按用户输入关键词分文件保存，并执行增量去重更新。"""
+    if not jobs:
+        return {
+            "file_count": 0,
+            "raw_count": 0,
+            "appended_count": 0,
+            "updated_count": 0,
+            "saved_files": [],
+        }
+
+    base_name = sanitize_filename(keyword, fallback="未知关键词")
+    file_name = f"{base_name}.xlsx"
+    file_path = output_dir / file_name
+
+    normalized_jobs = [normalize_job_record(item) for item in jobs]
+    existing_records = load_existing_job_records(file_path)
+    merged_records, appended_count, updated_count = merge_job_records(
+        existing_records=existing_records,
+        new_records=normalized_jobs,
+    )
+
+    write_job_records_to_excel(file_path, merged_records)
+    print(
+        f"关键词《{keyword}》写入完成：新增 {appended_count} 条，"
+        f"更新 {updated_count} 条，当前共 {len(merged_records)} 条 -> {file_path}"
+    )
+
+    return {
+        "file_count": 1,
+        "raw_count": len(jobs),
+        "appended_count": appended_count,
+        "updated_count": updated_count,
+        "saved_files": [str(file_path)],
+    }
 
 
 def print_config_summary(settings: dict[str, Any], config_path: Path) -> None:
@@ -611,6 +752,8 @@ def print_config_summary(settings: dict[str, Any], config_path: Path) -> None:
     print(f"地区：{regions}")
     print(f"每个地区最大页数：{settings['max_pages_per_region']}")
     print(f"浏览器无头模式：{settings['headless']}")
+    print(f"输出目录：{settings['output_dir']}")
+    print(f"批量任务数：{len(settings['keywords']) * len(settings['regions'])}")
 
 async def main() -> None:
     script_dir = Path(__file__).resolve().parent
@@ -626,28 +769,59 @@ async def main() -> None:
     print("提示：程序将自动打开浏览器抓取智联招聘数据。")
     print_config_summary(settings, config_path)
 
-    all_jobs = []
+    total_tasks = len(settings["keywords"]) * len(settings["regions"])
+    current_task = 0
+    saved_file_count = 0
+    raw_total = 0
+    appended_total = 0
+    updated_total = 0
+    saved_files: list[str] = []
+
     for keyword in settings["keywords"]:
+        keyword_jobs = []
         for city in settings["regions"]:
+            current_task += 1
+            print(f"\n任务进度：{current_task}/{total_tasks}（关键词={keyword}，地区={city}）")
             region_jobs = await crawl_zhaopin(
                 keyword=keyword,
                 city=city,
                 settings=settings,
             )
-            all_jobs.extend(region_jobs)
+            keyword_jobs.extend(region_jobs)
 
-    if not all_jobs:
+        if not keyword_jobs:
+            print(f"\n关键词《{keyword}》未抓取到数据，已跳过写入。")
+            continue
+
+        keyword_summary = save_jobs_by_keyword(
+            keyword_jobs,
+            output_dir=settings["output_dir"],
+            keyword=keyword,
+        )
+        saved_file_count += keyword_summary["file_count"]
+        raw_total += keyword_summary["raw_count"]
+        appended_total += keyword_summary["appended_count"]
+        updated_total += keyword_summary["updated_count"]
+        saved_files.extend(keyword_summary["saved_files"])
+
+    if not saved_file_count:
         print("未抓取到数据，请稍后重试或检查配置。")
         return
 
-    filename = save_to_excel(
-        all_jobs,
-        output_dir=settings["output_dir"],
-        filename_prefix=settings["output_filename_prefix"],
+    print(
+        f"\n爬取完成！原始抓取 {raw_total} 条，"
+        f"共写入 {saved_file_count} 个关键词文件。"
     )
-    if filename:
-        print(f"\n爬取完成！共 {len(all_jobs)} 条数据，已保存到：{filename}")
-        print("表格列：序号 | 搜索关键词 | 抓取地区 | 招聘单位名称 | 岗位名称 | 能力描述")
+    print(
+        f"本次增量结果：新增 {appended_total} 条，"
+        f"更新 {updated_total} 条。"
+    )
+    print(f"输出目录：{settings['output_dir']}")
+    print("表格列：序号 | 搜索关键词 | 抓取地区 | 招聘单位名称 | 岗位名称 | 能力描述")
+    if saved_files:
+        print("文件列表：")
+        for path in saved_files:
+            print(f"- {path}")
 
 
 if __name__ == "__main__":
