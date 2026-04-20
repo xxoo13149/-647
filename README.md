@@ -25,9 +25,15 @@
 2. **安装依赖**
    建议使用虚拟环境进行安装：
    ```bash
-   pip install python-dotenv
+   pip install python-dotenv playwright
    # 安装其他必要依赖，如 requirements.txt 存在：
    # pip install -r requirements.txt
+   ```
+
+3. **安装 Playwright 浏览器内核**
+   本项目依赖 Playwright 来驱动浏览器抓取数据。在第一次运行前，您必须下载相关的浏览器二进制文件（由于本项目默认使用 Chrome/Chromium，建议仅安装 Chromium 以节省时间）：
+   ```bash
+   playwright install chromium
    ```
 
 ## 配置说明
