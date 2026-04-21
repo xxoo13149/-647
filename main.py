@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import datetime as dt
 import json
 import os
 import random
@@ -41,7 +42,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "output_dir": "output",
 }
 
-OUTPUT_COLUMNS = ["招聘单位名称", "岗位名称", "能力描述"]
+OUTPUT_COLUMNS = ["招聘单位名称", "岗位名称", "最新发布时间", "能力描述"]
 
 
 async def human_sleep(min_s: float = 1.5, max_s: float = 3.5) -> None:
@@ -136,6 +137,204 @@ def build_ability_desc(
     return "；".join(parts)
 
 
+def normalize_publish_time_text(raw: Any) -> str:
+    """归一化岗位发布时间/更新时间文本。"""
+    text = clean_text(str(raw))
+    if not text:
+        return ""
+
+    text = re.sub(r"^(最新)?(发布|发布时间|更新时间|更新于|发布于)[:：]?\s*", "", text)
+    return clean_text(text)
+
+
+def extract_publish_time_from_any(value: Any) -> str:
+    """从任意值中提取可展示的发布时间字符串。"""
+    if value is None:
+        return ""
+
+    if isinstance(value, (int, float)):
+        ts = int(value)
+        try:
+            # 兼容秒级/毫秒级时间戳。
+            if ts > 10**12:
+                parsed = dt.datetime.fromtimestamp(ts / 1000)
+                return parsed.strftime("%Y-%m-%d %H:%M")
+            if ts > 10**9:
+                parsed = dt.datetime.fromtimestamp(ts)
+                return parsed.strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError, OverflowError):
+            pass
+        return normalize_publish_time_text(value)
+
+    if isinstance(value, dict):
+        for key in ["desc", "text", "name", "value", "time", "date", "updateTime", "publishTime"]:
+            extracted = extract_publish_time_from_any(value.get(key))
+            if extracted:
+                return extracted
+        for nested in value.values():
+            extracted = extract_publish_time_from_any(nested)
+            if extracted:
+                return extracted
+        return ""
+
+    if isinstance(value, list):
+        for nested in value:
+            extracted = extract_publish_time_from_any(nested)
+            if extracted:
+                return extracted
+        return ""
+
+    return normalize_publish_time_text(value)
+
+
+def looks_like_publish_time(text: str) -> bool:
+    """判断文本是否像发布时间。"""
+    if not text:
+        return False
+
+    if re.search(r"\d{4}[./-]\d{1,2}[./-]\d{1,2}(?:\s+\d{1,2}:\d{2})?", text):
+        return True
+    if re.search(r"\d{1,2}[./-]\d{1,2}(?:\s+\d{1,2}:\d{2})?", text):
+        return True
+    if re.search(r"\d+\s*(分钟前|小时前|天前)", text):
+        return True
+    if any(token in text for token in ["今天", "昨天", "刚刚", "发布", "更新"]):
+        return True
+    return False
+
+
+def extract_latest_publish_time_from_state_item(item: dict[str, Any]) -> str:
+    """从 state 岗位项中提取发布时间/更新时间。"""
+    key_candidates = [
+        "refreshTime",
+        "refreshDate",
+        "updateTime",
+        "updateDate",
+        "lastUpdateTime",
+        "lastModifyTime",
+        "publishTime",
+        "publishDate",
+        "releaseTime",
+        "releaseDate",
+        "createTime",
+        "createDate",
+        "timeDesc",
+    ]
+
+    for key in key_candidates:
+        extracted = extract_publish_time_from_any(item.get(key))
+        if extracted:
+            return extracted
+
+    for key, value in item.items():
+        if not isinstance(key, str):
+            continue
+        key_lower = key.lower()
+        if "time" not in key_lower and "date" not in key_lower:
+            continue
+        extracted = extract_publish_time_from_any(value)
+        if extracted:
+            return extracted
+
+    return ""
+
+
+def extract_latest_publish_time_from_dom_card(card) -> str:
+    """从 DOM 岗位卡片中兜底提取发布时间/更新时间。"""
+    selector_candidates = [
+        "span.jobinfo__time",
+        "span.jobinfo__meta-time",
+        "div.jobinfo__meta span",
+        "div.joblist-box__item-footer span",
+        "div.jobinfo__other-info-item",
+    ]
+
+    for selector in selector_candidates:
+        for node in card.select(selector):
+            text = normalize_publish_time_text(node.get_text())
+            if text and looks_like_publish_time(text):
+                return text
+
+    card_text = clean_text(card.get_text(" ", strip=True))
+    match = re.search(
+        r"(\d{4}[./-]\d{1,2}[./-]\d{1,2}(?:\s+\d{1,2}:\d{2})?|"
+        r"\d{1,2}[./-]\d{1,2}(?:\s+\d{1,2}:\d{2})?|"
+        r"\d+\s*(?:分钟前|小时前|天前)|今天|昨天|刚刚)",
+        card_text,
+    )
+    if match:
+        return normalize_publish_time_text(match.group(1))
+
+    return ""
+
+
+def parse_publish_time_to_datetime(value: str) -> dt.datetime | None:
+    """尽量将发布时间文本解析为 datetime，用于判断新旧。"""
+    text = normalize_publish_time_text(value)
+    if not text:
+        return None
+
+    now = dt.datetime.now()
+    if text == "刚刚":
+        return now
+    if text == "今天":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if text == "昨天":
+        return (now - dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    minute_match = re.search(r"(\d+)\s*分钟前", text)
+    if minute_match:
+        return now - dt.timedelta(minutes=int(minute_match.group(1)))
+
+    hour_match = re.search(r"(\d+)\s*小时前", text)
+    if hour_match:
+        return now - dt.timedelta(hours=int(hour_match.group(1)))
+
+    day_match = re.search(r"(\d+)\s*天前", text)
+    if day_match:
+        return now - dt.timedelta(days=int(day_match.group(1)))
+
+    patterns = [
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m-%d %H:%M",
+        "%m/%d %H:%M",
+        "%m-%d",
+        "%m/%d",
+    ]
+    for pattern in patterns:
+        try:
+            parsed = dt.datetime.strptime(text, pattern)
+            if pattern.startswith("%m"):
+                parsed = parsed.replace(year=now.year)
+            return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def choose_latest_publish_time(current_value: str, new_value: str) -> str:
+    """在现有时间与新时间之间尽量选择更新的时间。"""
+    current_text = normalize_publish_time_text(current_value)
+    new_text = normalize_publish_time_text(new_value)
+
+    if not new_text:
+        return current_text
+    if not current_text:
+        return new_text
+
+    current_dt = parse_publish_time_to_datetime(current_text)
+    new_dt = parse_publish_time_to_datetime(new_text)
+
+    if current_dt and new_dt:
+        return new_text if new_dt >= current_dt else current_text
+
+    # 无法可靠比较时，默认保留本次新抓取值。
+    return new_text if new_text != current_text else current_text
+
+
 def parse_jobs_from_state(state: dict) -> list[dict]:
     """优先从 __INITIAL_STATE__.positionList 解析岗位。"""
     jobs = []
@@ -166,11 +365,13 @@ def parse_jobs_from_state(state: dict) -> list[dict]:
             tags=tags,
             summary=summary,
         )
+        latest_publish_time = extract_latest_publish_time_from_state_item(item)
 
         jobs.append(
             {
                 "招聘单位名称": company_name,
                 "岗位名称": job_name,
+                "最新发布时间": latest_publish_time,
                 "能力描述": ability_desc,
                 "__工作城市": work_city,
             }
@@ -223,11 +424,13 @@ def parse_jobs_from_dom(html: str) -> list[dict]:
             tags=tags,
             summary="",
         )
+        latest_publish_time = extract_latest_publish_time_from_dom_card(card)
 
         jobs.append(
             {
                 "招聘单位名称": company_name,
                 "岗位名称": job_name,
+                "最新发布时间": latest_publish_time,
                 "能力描述": ability_desc,
                 "__工作城市": location,
             }
@@ -588,6 +791,7 @@ def normalize_job_record(item: dict[str, Any]) -> dict[str, str]:
         record["招聘单位名称"] = "未知单位"
     if not record["岗位名称"]:
         record["岗位名称"] = "未知岗位"
+    record["最新发布时间"] = normalize_publish_time_text(record["最新发布时间"]) or "未知"
 
     return record
 
@@ -646,6 +850,14 @@ def merge_job_records(
 
         current = merged_map[key]
         changed = False
+
+        merged_publish_time = choose_latest_publish_time(
+            current["最新发布时间"],
+            normalized["最新发布时间"],
+        )
+        if merged_publish_time != current["最新发布时间"]:
+            current["最新发布时间"] = merged_publish_time
+            changed = True
 
         if normalized["能力描述"] and normalized["能力描述"] != current["能力描述"]:
             current["能力描述"] = normalized["能力描述"]
@@ -783,7 +995,7 @@ async def main() -> None:
         f"更新 {updated_total} 条。"
     )
     print(f"输出目录：{settings['output_dir']}")
-    print("表格列：序号 | 招聘单位名称 | 岗位名称 | 能力描述")
+    print("表格列：序号 | 招聘单位名称 | 岗位名称 | 最新发布时间 | 能力描述")
     if saved_files:
         print("文件列表：")
         for path in saved_files:
