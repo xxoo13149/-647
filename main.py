@@ -35,10 +35,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ),
     "viewport": {"width": 1400, "height": 900},
     "delay_seconds": {
-        "after_open_search": [2.5, 4.0],
-        "between_pages": [1.8, 3.0],
-        "retry_reload": [4.0, 6.0],
+        "after_open_search": [1.0, 2.0],
+        "between_pages": [0.8, 1.5],
+        "retry_reload": [2.5, 4.0],
+        "between_tasks": [2.5, 4.5],
+        "before_next_page": [0.5, 1.0],
+        "after_next_page": [1.0, 1.8],
+        "long_break": [6.0, 10.0],
     },
+    "typing_delay_ms": [40, 100],
+    "retry_backoff_factor": 1.7,
+    "max_retry_delay_seconds": 36.0,
+    "long_break_every_pages": 5,
+    "long_break_probability": 0.2,
     "output_dir": "output",
 }
 
@@ -128,8 +137,6 @@ def build_ability_desc(
         parts.append("技能标签：" + " / ".join(tags[:10]))
     if summary:
         summary = clean_text(summary)
-        if len(summary) > 420:
-            summary = summary[:420] + "..."
         parts.append("岗位摘要：" + summary)
 
     if not parts:
@@ -511,6 +518,50 @@ def parse_positive_int(value: Any, default: int) -> int:
         return default
 
 
+def parse_positive_float(value: Any, default: float) -> float:
+    """解析正浮点数配置。"""
+    try:
+        parsed = float(value)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_probability(value: Any, default: float) -> float:
+    """解析概率值，范围限制在 [0, 1]。"""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    if parsed < 0:
+        return 0.0
+    if parsed > 1:
+        return 1.0
+    return parsed
+
+
+def scale_retry_delay(
+    delay_range: tuple[float, float],
+    attempt: int,
+    backoff_factor: float,
+    max_seconds: float,
+) -> tuple[float, float]:
+    """按重试次数放大延时，降低连续重试触发风控的概率。"""
+    if attempt <= 1:
+        return delay_range
+
+    base_low, base_high = delay_range
+    multiplier = backoff_factor ** (attempt - 1)
+    scaled_low = min(base_low * multiplier, max_seconds)
+    scaled_high = min(base_high * multiplier, max_seconds)
+
+    if scaled_low > scaled_high:
+        scaled_low, scaled_high = scaled_high, scaled_low
+
+    return scaled_low, scaled_high
+
+
 def load_env_config(env_path: Path) -> dict[str, Any]:
     """加载并解析 .env 文件。"""
     if env_path.exists():
@@ -575,6 +626,22 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
         except ValueError:
             return default
 
+    def parse_int_range_env(env_val: str, default: tuple[int, int]) -> tuple[int, int]:
+        if not env_val:
+            return default
+        parts = env_val.split(",")
+        if len(parts) != 2:
+            return default
+        try:
+            low, high = int(parts[0]), int(parts[1])
+            if low <= 0 or high <= 0:
+                return default
+            if low > high:
+                low, high = high, low
+            return low, high
+        except ValueError:
+            return default
+
     settings = {
         "keywords": keywords,
         "regions": regions,
@@ -587,10 +654,55 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
             "height": parse_positive_int(os.getenv("VIEWPORT_HEIGHT", "900"), 900),
         },
         "delays": {
-            "after_open_search": parse_delay_env(os.getenv("DELAY_AFTER_OPEN_SEARCH", ""), (2.5, 4.0)),
-            "between_pages": parse_delay_env(os.getenv("DELAY_BETWEEN_PAGES", ""), (1.8, 3.0)),
-            "retry_reload": parse_delay_env(os.getenv("DELAY_RETRY_RELOAD", ""), (4.0, 6.0)),
+            "after_open_search": parse_delay_env(
+                os.getenv("DELAY_AFTER_OPEN_SEARCH", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["after_open_search"]),
+            ),
+            "between_pages": parse_delay_env(
+                os.getenv("DELAY_BETWEEN_PAGES", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["between_pages"]),
+            ),
+            "retry_reload": parse_delay_env(
+                os.getenv("DELAY_RETRY_RELOAD", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["retry_reload"]),
+            ),
+            "between_tasks": parse_delay_env(
+                os.getenv("DELAY_BETWEEN_TASKS", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["between_tasks"]),
+            ),
+            "before_next_page": parse_delay_env(
+                os.getenv("DELAY_BEFORE_NEXT_PAGE", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["before_next_page"]),
+            ),
+            "after_next_page": parse_delay_env(
+                os.getenv("DELAY_AFTER_NEXT_PAGE", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["after_next_page"]),
+            ),
+            "long_break": parse_delay_env(
+                os.getenv("DELAY_LONG_BREAK", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["long_break"]),
+            ),
         },
+        "typing_delay_ms": parse_int_range_env(
+            os.getenv("TYPE_DELAY_MS", ""),
+            tuple(DEFAULT_CONFIG["typing_delay_ms"]),
+        ),
+        "retry_backoff_factor": parse_positive_float(
+            os.getenv("RETRY_BACKOFF_FACTOR", str(DEFAULT_CONFIG["retry_backoff_factor"])),
+            float(DEFAULT_CONFIG["retry_backoff_factor"]),
+        ),
+        "max_retry_delay_seconds": parse_positive_float(
+            os.getenv("MAX_RETRY_DELAY_SECONDS", str(DEFAULT_CONFIG["max_retry_delay_seconds"])),
+            float(DEFAULT_CONFIG["max_retry_delay_seconds"]),
+        ),
+        "long_break_every_pages": parse_positive_int(
+            os.getenv("LONG_BREAK_EVERY_PAGES", str(DEFAULT_CONFIG["long_break_every_pages"])),
+            int(DEFAULT_CONFIG["long_break_every_pages"]),
+        ),
+        "long_break_probability": parse_probability(
+            os.getenv("LONG_BREAK_PROBABILITY", str(DEFAULT_CONFIG["long_break_probability"])),
+            float(DEFAULT_CONFIG["long_break_probability"]),
+        ),
         "output_dir": output_dir_path,
     }
     return settings
@@ -601,10 +713,18 @@ async def search_keyword_in_city(
     keyword: str,
     city_name: str,
     delay: tuple[float, float],
+    typing_delay_ms: tuple[int, int],
 ) -> None:
     """按关键词 + 城市名称直达搜索页，确保输入岗位和地区同时生效。"""
     target_url = build_search_url(keyword=keyword, city_name=city_name, page=1)
-    await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+    try:
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+    except Exception as e:
+        print(f"首次请求出现异常（可能网络波动）：{e}，正在重试...")
+        import asyncio
+        await asyncio.sleep(3.0)
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+
     await human_sleep(*delay)
 
     # 校验页面状态中的关键词是否与输入一致；若不一致，尝试输入框兜底。
@@ -622,7 +742,7 @@ async def search_keyword_in_city(
         search_input = page.locator("input.query-search__content-input:visible").first
         await search_input.click()
         await search_input.fill("")
-        await search_input.fill(keyword)
+        await search_input.type(keyword, delay=random.randint(typing_delay_ms[0], typing_delay_ms[1]))
 
         try:
             await page.click("button.query-search__content-button", timeout=10000)
@@ -664,6 +784,7 @@ async def crawl_zhaopin(
                 keyword=keyword,
                 city_name=city,
                 delay=settings["delays"]["after_open_search"],
+                typing_delay_ms=settings["typing_delay_ms"],
             )
 
             current_page = 1
@@ -691,7 +812,13 @@ async def crawl_zhaopin(
                                 f"自动重试（{empty_retry_count}/{settings['max_empty_page_retries']}）..."
                             )
 
-                        await human_sleep(*settings["delays"]["retry_reload"])
+                        retry_delay = scale_retry_delay(
+                            settings["delays"]["retry_reload"],
+                            attempt=empty_retry_count,
+                            backoff_factor=settings["retry_backoff_factor"],
+                            max_seconds=settings["max_retry_delay_seconds"],
+                        )
+                        await human_sleep(*retry_delay)
                         await page.reload(wait_until="domcontentloaded", timeout=90000)
                         continue
 
@@ -746,7 +873,27 @@ async def crawl_zhaopin(
                     print("已到最后一页。")
                     break
 
-                await page.goto(next_url, wait_until="domcontentloaded", timeout=90000)
+                if (
+                    settings["long_break_every_pages"] > 0
+                    and current_page % settings["long_break_every_pages"] == 0
+                    and random.random() < settings["long_break_probability"]
+                ):
+                    print("执行随机冷却暂停，降低高频行为特征。")
+                    await human_sleep(*settings["delays"]["long_break"])
+
+                await human_sleep(*settings["delays"]["before_next_page"])
+                try:
+                    await page.goto(next_url, wait_until="domcontentloaded", timeout=90000)
+                except Exception as e:
+                    print(f"跳转下一页时遇到网络异常：{e}，正在重试...")
+                    await human_sleep(2.0, 4.0)
+                    try:
+                        await page.goto(next_url, wait_until="domcontentloaded", timeout=90000)
+                    except Exception as e2:
+                        print(f"重试跳页依然失败：{e2}，结束当前搜索。")
+                        break
+
+                await human_sleep(*settings["delays"]["after_next_page"])
                 current_page = next_page
 
         finally:
@@ -930,6 +1077,9 @@ def print_config_summary(settings: dict[str, Any], env_path: Path) -> None:
     print(f"地区：{regions}")
     print(f"每个地区最大页数：{settings['max_pages_per_region']}")
     print(f"浏览器无头模式：{settings['headless']}")
+    print(f"翻页延时（秒）：{settings['delays']['between_pages'][0]} - {settings['delays']['between_pages'][1]}")
+    print(f"任务冷却（秒）：{settings['delays']['between_tasks'][0]} - {settings['delays']['between_tasks'][1]}")
+    print(f"随机长暂停概率：{settings['long_break_probability']}")
     print(f"输出目录：{settings['output_dir']}")
     print(f"批量任务数：{len(settings['keywords']) * len(settings['regions'])}")
 
@@ -966,6 +1116,9 @@ async def main() -> None:
                 settings=settings,
             )
             keyword_jobs.extend(region_jobs)
+
+            if current_task < total_tasks:
+                await human_sleep(*settings["delays"]["between_tasks"])
 
         if not keyword_jobs:
             print(f"\n关键词《{keyword}》未抓取到数据，已跳过写入。")
