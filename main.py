@@ -830,19 +830,7 @@ async def crawl_zhaopin(
 
                 empty_retry_count = 0
 
-                page_jobs = []
-                filtered_other_city = 0
-                for item in raw_page_jobs:
-                    job_city = clean_text(str(item.get("__工作城市", "")))
-                    if not is_job_in_target_city(job_city=job_city, target_city=city):
-                        filtered_other_city += 1
-                        continue
-                    page_jobs.append(item)
-
-                if filtered_other_city:
-                    print(
-                        f"第 {current_page} 页已过滤 {filtered_other_city} 条非目标城市岗位（目标城市：{city}）。"
-                    )
+                page_jobs = raw_page_jobs
 
                 new_count = 0
                 for item in page_jobs:
