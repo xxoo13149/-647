@@ -42,10 +42,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "before_next_page": [0.5, 1.0],
         "after_next_page": [1.0, 1.8],
         "long_break": [6.0, 10.0],
+        "before_open_detail": [0.8, 1.6],
+        "after_open_detail": [1.8, 3.0],
+        "between_details": [0.9, 1.8],
+        "detail_retry": [2.5, 4.5],
     },
     "typing_delay_ms": [40, 100],
     "retry_backoff_factor": 1.7,
     "max_retry_delay_seconds": 36.0,
+    "max_detail_retries": 1,
+    "detail_page_timeout_ms": 90000,
     "long_break_every_pages": 5,
     "long_break_probability": 0.2,
     "output_dir": "output",
@@ -64,6 +70,20 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_multiline_text(text: str) -> str:
+    """压缩每行空白并保留换行，适合岗位职责等长文本。"""
+    if not text:
+        return ""
+
+    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for raw_line in normalized.split("\n"):
+        line = re.sub(r"[ \t\f\v]+", " ", raw_line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def normalize_city_name(raw_city: str) -> str:
@@ -115,6 +135,41 @@ def build_search_url(keyword: str, city_name: str, page: int = 1) -> str:
     return f"{ZHAOPIN_SEARCH_URL}?{urllib.parse.urlencode(params)}"
 
 
+def normalize_absolute_url(url: str, base_url: str = "https://www.zhaopin.com") -> str:
+    """将相对链接、协议相对链接归一化为绝对链接。"""
+    text = clean_text(url)
+    if not text:
+        return ""
+    if text.startswith("//"):
+        return "https:" + text
+    return urllib.parse.urljoin(base_url, text)
+
+
+def extract_detail_url_from_state_item(item: dict[str, Any]) -> str:
+    """从列表 state 项中提取职位详情页链接。"""
+    key_candidates = [
+        "positionURL",
+        "positionUrl",
+        "positionurl",
+        "jobUrl",
+        "jobURL",
+        "joburl",
+        "positionDetailUrl",
+        "detailUrl",
+        "positionHref",
+    ]
+
+    for key in key_candidates:
+        value = item.get(key)
+        if not isinstance(value, str):
+            continue
+        normalized = normalize_absolute_url(value)
+        if normalized.startswith("http"):
+            return normalized
+
+    return ""
+
+
 def build_ability_desc(
     salary: str,
     location: str,
@@ -136,12 +191,131 @@ def build_ability_desc(
     if tags:
         parts.append("技能标签：" + " / ".join(tags[:10]))
     if summary:
-        summary = clean_text(summary)
+        summary = clean_multiline_text(summary)
         parts.append("岗位摘要：" + summary)
 
     if not parts:
         return "（暂无能力描述）"
     return "；".join(parts)
+
+
+def looks_like_job_summary_text(text: str) -> bool:
+    """判断文本是否像岗位详情摘要。"""
+    cleaned = clean_text(text)
+    if len(cleaned) < 60:
+        return False
+    if any(token in cleaned for token in ["职位描述", "岗位职责", "任职要求", "工作内容", "岗位要求"]):
+        return True
+    return len(cleaned) >= 180
+
+
+def extract_job_summary_from_detail_state(state: dict[str, Any]) -> str:
+    """从详情页 state 中提取较完整的岗位描述。"""
+    best = ""
+    key_hints = (
+        "summary",
+        "description",
+        "detail",
+        "content",
+        "responsibility",
+        "requirement",
+        "duty",
+        "jobdesc",
+        "positiondesc",
+    )
+
+    def walk(node: Any, key_hint: str = "") -> None:
+        nonlocal best
+
+        if isinstance(node, str):
+            candidate = clean_multiline_text(node)
+            if not candidate:
+                return
+            key_lower = key_hint.lower()
+            if any(hint in key_lower for hint in key_hints) or looks_like_job_summary_text(candidate):
+                if len(candidate) > len(best):
+                    best = candidate
+            return
+
+        if isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, str(key))
+            return
+
+        if isinstance(node, list):
+            for value in node:
+                walk(value, key_hint)
+
+    walk(state)
+    return best
+
+
+def extract_job_summary_from_detail_dom(html: str) -> str:
+    """从详情页 DOM 中提取岗位描述文本。"""
+    soup = BeautifulSoup(html, "html.parser")
+    selector_candidates = [
+        "div.describtion-card__detail-content",
+        "div.jobdetail-box__content",
+        "div.describtion__detail-content",
+        "div.jobdetail__content",
+        "div.job-detail",
+        "div.job-description",
+        "section.jobdetail__content",
+        "div.jobrequirement",
+    ]
+
+    candidates = []
+    for selector in selector_candidates:
+        for node in soup.select(selector):
+            text = clean_multiline_text(node.get_text("\n", strip=True))
+            if looks_like_job_summary_text(text):
+                candidates.append(text)
+
+    if candidates:
+        return max(candidates, key=len)
+
+    body_text = clean_multiline_text(soup.get_text("\n", strip=True))
+    for marker in ["职位描述", "岗位职责", "任职要求"]:
+        idx = body_text.find(marker)
+        if idx < 0:
+            continue
+        snippet = clean_multiline_text(body_text[idx : idx + 5000])
+        if looks_like_job_summary_text(snippet):
+            return snippet
+
+    return ""
+
+
+def extract_job_summary_from_detail_html(html: str) -> str:
+    """从详情页 HTML 提取尽可能完整的岗位描述。"""
+    state = extract_initial_state(html)
+    from_state = extract_job_summary_from_detail_state(state) if state else ""
+    from_dom = extract_job_summary_from_detail_dom(html)
+
+    # 优先返回页面可见的详情正文，其次再回退到 state 抽取结果。
+    if from_dom:
+        return from_dom
+    return from_state
+
+
+def merge_summary_into_ability_desc(ability_desc: str, summary: str) -> str:
+    """将完整岗位摘要合并回能力描述字段。"""
+    summary_text = clean_multiline_text(summary)
+    if not summary_text:
+        return clean_multiline_text(ability_desc) or "（暂无能力描述）"
+
+    marker = "岗位摘要："
+    base_desc = clean_multiline_text(ability_desc)
+    if not base_desc or base_desc == "（暂无能力描述）":
+        return marker + summary_text
+
+    if marker in base_desc:
+        prefix = base_desc.split(marker, 1)[0].rstrip("；")
+        if prefix:
+            return prefix + "；" + marker + summary_text
+        return marker + summary_text
+
+    return base_desc + "；" + marker + summary_text
 
 
 def normalize_publish_time_text(raw: Any) -> str:
@@ -363,6 +537,7 @@ def parse_jobs_from_state(state: dict) -> list[dict]:
             if clean_text(tag.get("name", ""))
         ]
         summary = item.get("jobSummary", "")
+        detail_url = extract_detail_url_from_state_item(item)
 
         ability_desc = build_ability_desc(
             salary=salary,
@@ -381,6 +556,7 @@ def parse_jobs_from_state(state: dict) -> list[dict]:
                 "最新发布时间": latest_publish_time,
                 "能力描述": ability_desc,
                 "__工作城市": work_city,
+                "__详情链接": detail_url,
             }
         )
 
@@ -399,6 +575,7 @@ def parse_jobs_from_dom(html: str) -> list[dict]:
         title_tag = card.select_one("a.jobinfo__name")
         company_tag = card.select_one("a.companyinfo__name")
         salary_tag = card.select_one("p.jobinfo__salary")
+        detail_url = normalize_absolute_url(title_tag.get("href", "")) if title_tag else ""
 
         job_name = clean_text(title_tag.get_text()) if title_tag else "未知岗位"
         company_name = clean_text(company_tag.get_text()) if company_tag else "未知单位"
@@ -440,6 +617,7 @@ def parse_jobs_from_dom(html: str) -> list[dict]:
                 "最新发布时间": latest_publish_time,
                 "能力描述": ability_desc,
                 "__工作城市": location,
+                "__详情链接": detail_url,
             }
         )
 
@@ -495,7 +673,13 @@ def looks_like_verification_page(html: str) -> bool:
 
 async def search_keyword(page, keyword: str) -> None:
     """兼容旧调用（未指定城市时默认广州）。"""
-    await search_keyword_in_city(page, keyword=keyword, city_name="广州", delay=(2.5, 4.0))
+    await search_keyword_in_city(
+        page,
+        keyword=keyword,
+        city_name="广州",
+        delay=(2.5, 4.0),
+        typing_delay_ms=tuple(DEFAULT_CONFIG["typing_delay_ms"]),
+    )
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
@@ -560,6 +744,103 @@ def scale_retry_delay(
         scaled_low, scaled_high = scaled_high, scaled_low
 
     return scaled_low, scaled_high
+
+
+async def fetch_job_summary_from_detail_page(
+    detail_page,
+    detail_url: str,
+    settings: dict[str, Any],
+) -> str:
+    """抓取职位详情页并提取完整岗位摘要。"""
+    max_retries = settings["max_detail_retries"]
+    for attempt in range(1, max_retries + 2):
+        try:
+            await human_sleep(*settings["delays"]["before_open_detail"])
+            await detail_page.goto(
+                detail_url,
+                wait_until="domcontentloaded",
+                timeout=settings["detail_page_timeout_ms"],
+            )
+            await human_sleep(*settings["delays"]["after_open_detail"])
+
+            html = await detail_page.content()
+            if looks_like_verification_page(html):
+                raise RuntimeError("详情页疑似触发验证")
+
+            summary = extract_job_summary_from_detail_html(html)
+            if summary:
+                return summary
+
+            if attempt > max_retries:
+                print(f"详情页未提取到岗位摘要，已放弃：{detail_url}")
+                return ""
+
+            raise RuntimeError("详情页未提取到岗位摘要")
+        except Exception as exc:
+            if attempt > max_retries:
+                print(f"详情页抓取失败，已放弃：{detail_url}，原因：{exc}")
+                return ""
+
+            retry_delay = scale_retry_delay(
+                settings["delays"]["detail_retry"],
+                attempt=attempt,
+                backoff_factor=settings["retry_backoff_factor"],
+                max_seconds=settings["max_retry_delay_seconds"],
+            )
+            print(
+                f"详情页抓取异常，准备重试（{attempt}/{max_retries}）：{detail_url}，原因：{exc}"
+            )
+            await human_sleep(*retry_delay)
+
+    return ""
+
+
+async def enrich_jobs_with_detail_summaries(
+    context,
+    jobs: list[dict[str, Any]],
+    settings: dict[str, Any],
+    summary_cache: dict[str, str],
+) -> int:
+    """逐条访问详情页，补全能力描述中的岗位摘要。"""
+    if not jobs:
+        return 0
+
+    updated_count = 0
+    detail_page = await context.new_page()
+
+    try:
+        for item in jobs:
+            detail_url = clean_text(str(item.get("__详情链接", "")))
+            if not detail_url:
+                continue
+
+            fetched_from_network = False
+            if detail_url in summary_cache:
+                full_summary = summary_cache[detail_url]
+            else:
+                fetched_from_network = True
+                full_summary = await fetch_job_summary_from_detail_page(
+                    detail_page=detail_page,
+                    detail_url=detail_url,
+                    settings=settings,
+                )
+                summary_cache[detail_url] = full_summary
+
+            if full_summary:
+                merged_desc = merge_summary_into_ability_desc(
+                    ability_desc=str(item.get("能力描述", "")),
+                    summary=full_summary,
+                )
+                if merged_desc != item.get("能力描述", ""):
+                    item["能力描述"] = merged_desc
+                    updated_count += 1
+
+            if fetched_from_network:
+                await human_sleep(*settings["delays"]["between_details"])
+    finally:
+        await detail_page.close()
+
+    return updated_count
 
 
 def load_env_config(env_path: Path) -> dict[str, Any]:
@@ -682,6 +963,22 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
                 os.getenv("DELAY_LONG_BREAK", ""),
                 tuple(DEFAULT_CONFIG["delay_seconds"]["long_break"]),
             ),
+            "before_open_detail": parse_delay_env(
+                os.getenv("DELAY_BEFORE_OPEN_DETAIL", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["before_open_detail"]),
+            ),
+            "after_open_detail": parse_delay_env(
+                os.getenv("DELAY_AFTER_OPEN_DETAIL", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["after_open_detail"]),
+            ),
+            "between_details": parse_delay_env(
+                os.getenv("DELAY_BETWEEN_DETAILS", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["between_details"]),
+            ),
+            "detail_retry": parse_delay_env(
+                os.getenv("DELAY_DETAIL_RETRY", ""),
+                tuple(DEFAULT_CONFIG["delay_seconds"]["detail_retry"]),
+            ),
         },
         "typing_delay_ms": parse_int_range_env(
             os.getenv("TYPE_DELAY_MS", ""),
@@ -694,6 +991,14 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
         "max_retry_delay_seconds": parse_positive_float(
             os.getenv("MAX_RETRY_DELAY_SECONDS", str(DEFAULT_CONFIG["max_retry_delay_seconds"])),
             float(DEFAULT_CONFIG["max_retry_delay_seconds"]),
+        ),
+        "max_detail_retries": parse_positive_int(
+            os.getenv("MAX_DETAIL_RETRIES", str(DEFAULT_CONFIG["max_detail_retries"])),
+            int(DEFAULT_CONFIG["max_detail_retries"]),
+        ),
+        "detail_page_timeout_ms": parse_positive_int(
+            os.getenv("DETAIL_PAGE_TIMEOUT_MS", str(DEFAULT_CONFIG["detail_page_timeout_ms"])),
+            int(DEFAULT_CONFIG["detail_page_timeout_ms"]),
         ),
         "long_break_every_pages": parse_positive_int(
             os.getenv("LONG_BREAK_EVERY_PAGES", str(DEFAULT_CONFIG["long_break_every_pages"])),
@@ -721,7 +1026,6 @@ async def search_keyword_in_city(
         await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
     except Exception as e:
         print(f"首次请求出现异常（可能网络波动）：{e}，正在重试...")
-        import asyncio
         await asyncio.sleep(3.0)
         await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
 
@@ -763,6 +1067,7 @@ async def crawl_zhaopin(
     """爬取智联招聘岗位数据并返回列表。"""
     jobs = []
     seen = set()
+    detail_summary_cache: dict[str, str] = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=settings["headless"])
@@ -831,6 +1136,12 @@ async def crawl_zhaopin(
                 empty_retry_count = 0
 
                 page_jobs = raw_page_jobs
+                detail_updated = await enrich_jobs_with_detail_summaries(
+                    context=context,
+                    jobs=page_jobs,
+                    settings=settings,
+                    summary_cache=detail_summary_cache,
+                )
 
                 new_count = 0
                 for item in page_jobs:
@@ -845,7 +1156,7 @@ async def crawl_zhaopin(
                     new_count += 1
 
                 print(
-                    f"第 {current_page} 页：解析 {len(raw_page_jobs)} 条，城市匹配 {len(page_jobs)} 条，"
+                    f"第 {current_page} 页：解析 {len(raw_page_jobs)} 条，详情补全 {detail_updated} 条，"
                     f"新增 {new_count} 条（累计 {len(jobs)} 条）"
                 )
 
@@ -920,7 +1231,13 @@ def merge_distinct_text(current_value: str, new_value: str) -> str:
 
 def normalize_job_record(item: dict[str, Any]) -> dict[str, str]:
     """标准化岗位记录字段。"""
-    record = {column: clean_text(str(item.get(column, ""))) for column in OUTPUT_COLUMNS}
+    record = {}
+    for column in OUTPUT_COLUMNS:
+        raw_value = str(item.get(column, ""))
+        if column == "能力描述":
+            record[column] = clean_multiline_text(raw_value)
+        else:
+            record[column] = clean_text(raw_value)
 
     if not record["招聘单位名称"]:
         record["招聘单位名称"] = "未知单位"
@@ -1066,8 +1383,13 @@ def print_config_summary(settings: dict[str, Any], env_path: Path) -> None:
     print(f"每个地区最大页数：{settings['max_pages_per_region']}")
     print(f"浏览器无头模式：{settings['headless']}")
     print(f"翻页延时（秒）：{settings['delays']['between_pages'][0]} - {settings['delays']['between_pages'][1]}")
+    print(
+        f"详情页延时（秒）：{settings['delays']['before_open_detail'][0]} - "
+        f"{settings['delays']['after_open_detail'][1]}"
+    )
     print(f"任务冷却（秒）：{settings['delays']['between_tasks'][0]} - {settings['delays']['between_tasks'][1]}")
     print(f"随机长暂停概率：{settings['long_break_probability']}")
+    print(f"详情页最大重试次数：{settings['max_detail_retries']}")
     print(f"输出目录：{settings['output_dir']}")
     print(f"批量任务数：{len(settings['keywords']) * len(settings['regions'])}")
 
