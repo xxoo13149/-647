@@ -1,0 +1,1 @@
+"""Job crawler application package."""
