@@ -22,6 +22,41 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def emit_task_log(settings: dict[str, Any], message: str) -> None:
+    """Write progress to the web task log when available, and keep CLI output visible."""
+    print(message)
+    callback = settings.get("log_callback") if isinstance(settings, dict) else None
+    if callable(callback):
+        callback(message)
+
+
+def update_task_progress(settings: dict[str, Any], **fields: Any) -> None:
+    """Store lightweight progress state used by the web heartbeat log."""
+    if not isinstance(settings, dict):
+        return
+    progress = settings.setdefault("progress", {})
+    if isinstance(progress, dict):
+        progress.update(fields)
+
+
+def is_cancel_requested(settings: dict[str, Any]) -> bool:
+    """Return whether the current web task has requested a graceful stop."""
+    if not isinstance(settings, dict):
+        return False
+    callback = settings.get("cancel_check_callback")
+    return bool(callable(callback) and callback())
+
+
+def emit_cancel_log_once(settings: dict[str, Any], message: str) -> None:
+    """Write one cancellation log line per crawler run."""
+    if not isinstance(settings, dict):
+        return
+    if settings.get("_cancel_logged"):
+        return
+    settings["_cancel_logged"] = True
+    emit_task_log(settings, message)
+
+
 def clean_multiline_text(text: str) -> str:
     """压缩每行空白并保留换行，适合岗位职责等长文本。"""
     if not text:
@@ -170,6 +205,8 @@ def is_job_in_target_city(job_city: str, target_city: str) -> bool:
     normalized_job_city = normalize_city_name(job_city)
 
     if not normalized_target:
+        return True
+    if normalized_target == "全国":  # "全国" 表示不限地区，全部通过
         return True
     if not normalized_job_city:
         return False

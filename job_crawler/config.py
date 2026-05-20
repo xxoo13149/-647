@@ -49,14 +49,24 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="招聘平台：zhaopin 或 51job。默认读取 .env 的 PLATFORM，未配置则为 zhaopin。",
     )
     parser.add_argument(
+        "--browser-backend",
+        choices=["playwright", "scrapling", "gologin", "adspower", "orbita_cdp"],
+        help="浏览器后端：playwright、scrapling、gologin、adspower 或 orbita_cdp。",
+    )
+    parser.add_argument(
         "--manual-auth",
         action="store_true",
-        help="兼容旧参数：等同于 --login-51job，显示真实浏览器等待人工登录。",
+        help="Show a real browser and pause for manual verification when the selected platform needs it.",
     )
     parser.add_argument(
         "--login-51job",
         action="store_true",
         help="只打开 51job 登录页面，等待人工用手机号/短信验证码登录，并保存浏览器用户目录。",
+    )
+    parser.add_argument(
+        "--login-zhaopin",
+        action="store_true",
+        help="Open Zhaopin in a real browser, wait for manual verification/login, and save the browser profile.",
     )
     parser.add_argument(
         "--auth-wait-seconds",
@@ -70,6 +80,11 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--user-data-dir",
         help="51job 真实登录浏览器用户目录，默认 auth/51job_profile。",
+    )
+
+    parser.add_argument(
+        "--zhaopin-user-data-dir",
+        help="Zhaopin browser profile directory. Defaults to auth/zhaopin_profile.",
     )
 
     headless_group = parser.add_mutually_exclusive_group()
@@ -93,6 +108,11 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-detail-retries",
         type=int,
         help="详情页抓取失败时的最大重试次数。",
+    )
+    parser.add_argument(
+        "--skip-detail-fetch",
+        action="store_true",
+        help="稳妥模式：只使用列表页字段导出，跳过详情页抓取，降低触发验证风险。",
     )
     return parser.parse_args(argv)
 
@@ -135,6 +155,9 @@ def apply_cli_overrides(
             raise ValueError("--max-detail-retries 必须是正整数")
         merged["max_detail_retries"] = args.max_detail_retries
 
+    if args.skip_detail_fetch:
+        merged["skip_detail_fetch"] = True
+
     if args.headless:
         merged["headless"] = True
     if args.headed:
@@ -146,10 +169,6 @@ def apply_cli_overrides(
             output_dir = (base_dir / output_dir).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         merged["output_dir"] = output_dir
-        if not args.crawled_links_dir:
-            crawled_links_dir = output_dir / "crawled_links"
-            crawled_links_dir.mkdir(parents=True, exist_ok=True)
-            merged["crawled_links_dir"] = crawled_links_dir
 
     if args.crawled_links_dir:
         crawled_links_dir = Path(clean_text(args.crawled_links_dir))
@@ -161,15 +180,24 @@ def apply_cli_overrides(
     if args.platform:
         merged["platform"] = args.platform
 
+    if args.browser_backend:
+        merged["browser_backend"] = args.browser_backend
+
     if args.manual_auth:
         merged["manual_auth"] = True
-        merged["login_51job"] = True
-        merged["platform"] = "51job"
         merged["headless"] = False
+        if merged.get("platform") == "51job":
+            merged["login_51job"] = True
 
     if args.login_51job:
         merged["login_51job"] = True
         merged["platform"] = "51job"
+        merged["headless"] = False
+
+    if args.login_zhaopin:
+        merged["login_zhaopin"] = True
+        merged["platform"] = "zhaopin"
+        merged["manual_auth"] = True
         merged["headless"] = False
 
     if args.auth_wait_seconds is not None:
@@ -188,6 +216,16 @@ def apply_cli_overrides(
         if not user_data_dir.is_absolute():
             user_data_dir = (base_dir / user_data_dir).resolve()
         merged["user_data_dir"] = user_data_dir
+
+    if args.zhaopin_user_data_dir:
+        zhaopin_user_data_dir = Path(clean_text(args.zhaopin_user_data_dir))
+        if not zhaopin_user_data_dir.is_absolute():
+            zhaopin_user_data_dir = (base_dir / zhaopin_user_data_dir).resolve()
+        merged["zhaopin_user_data_dir"] = zhaopin_user_data_dir
+
+    browser_backend = clean_text(str(os.getenv("BROWSER_BACKEND", merged.get("browser_backend", "playwright")))).lower()
+    if browser_backend:
+        merged["browser_backend"] = browser_backend
 
     return merged
 
@@ -257,6 +295,13 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
     user_data_dir = Path(user_data_dir_raw)
     if not user_data_dir.is_absolute():
         user_data_dir = (base_dir / user_data_dir).resolve()
+
+    zhaopin_user_data_dir_raw = clean_text(
+        os.getenv("ZHAOPIN_USER_DATA_DIR", DEFAULT_CONFIG["zhaopin_user_data_dir"])
+    )
+    zhaopin_user_data_dir = Path(zhaopin_user_data_dir_raw)
+    if not zhaopin_user_data_dir.is_absolute():
+        zhaopin_user_data_dir = (base_dir / zhaopin_user_data_dir).resolve()
 
     def parse_delay_env(env_val: str, default: tuple[float, float]) -> tuple[float, float]:
         if not env_val:
@@ -391,9 +436,44 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
             bool(DEFAULT_CONFIG["login_51job"]),
         ),
         "user_data_dir": user_data_dir,
+        "login_zhaopin": parse_bool(
+            os.getenv("LOGIN_ZHAOPIN", str(DEFAULT_CONFIG["login_zhaopin"])),
+            bool(DEFAULT_CONFIG["login_zhaopin"]),
+        ),
+        "zhaopin_user_data_dir": zhaopin_user_data_dir,
+        "browser_backend": clean_text(os.getenv("BROWSER_BACKEND", str(DEFAULT_CONFIG["browser_backend"]))).lower()
+        or str(DEFAULT_CONFIG["browser_backend"]),
+        "gologin_token": clean_text(os.getenv("GOLOGIN_TOKEN", DEFAULT_CONFIG["gologin_token"])),
+        "gologin_profile_id": clean_text(os.getenv("GOLOGIN_PROFILE_ID", DEFAULT_CONFIG["gologin_profile_id"])),
+        "adspower_api_key": clean_text(os.getenv("ADSPOWER_API_KEY", DEFAULT_CONFIG["adspower_api_key"])),
+        "adspower_api_port": clean_text(os.getenv("ADSPOWER_API_PORT", DEFAULT_CONFIG["adspower_api_port"])),
+        "scrapling_real_chrome": parse_bool(
+            os.getenv("SCRAPLING_REAL_CHROME", str(DEFAULT_CONFIG["scrapling_real_chrome"])),
+            bool(DEFAULT_CONFIG["scrapling_real_chrome"]),
+        ),
+        "scrapling_google_search": parse_bool(
+            os.getenv("SCRAPLING_GOOGLE_SEARCH", str(DEFAULT_CONFIG["scrapling_google_search"])),
+            bool(DEFAULT_CONFIG["scrapling_google_search"]),
+        ),
+        "scrapling_block_webrtc": parse_bool(
+            os.getenv("SCRAPLING_BLOCK_WEBRTC", str(DEFAULT_CONFIG["scrapling_block_webrtc"])),
+            bool(DEFAULT_CONFIG["scrapling_block_webrtc"]),
+        ),
+        "scrapling_hide_canvas": parse_bool(
+            os.getenv("SCRAPLING_HIDE_CANVAS", str(DEFAULT_CONFIG["scrapling_hide_canvas"])),
+            bool(DEFAULT_CONFIG["scrapling_hide_canvas"]),
+        ),
+        "skip_detail_fetch": parse_bool(
+            os.getenv("SKIP_DETAIL_FETCH", str(DEFAULT_CONFIG["skip_detail_fetch"])),
+            bool(DEFAULT_CONFIG["skip_detail_fetch"]),
+        ),
+        "yescaptcha_api_key": clean_text(os.getenv("YESCAPTCHA_API_KEY", "")),
+        "yescaptcha_proxy": clean_text(os.getenv("YESCAPTCHA_PROXY", "")),
     }
     if settings["platform"] not in {"zhaopin", "51job"}:
         raise ValueError("PLATFORM 仅支持 zhaopin 或 51job")
+    if settings["browser_backend"] not in {"playwright", "scrapling", "gologin", "adspower", "orbita_cdp"}:
+        raise ValueError("BROWSER_BACKEND 仅支持 playwright、scrapling、gologin、adspower 或 orbita_cdp")
     return settings
 
 
@@ -419,6 +499,29 @@ def print_config_summary(settings: dict[str, Any], env_path: Path) -> None:
     if settings["platform"] == "51job":
         print(f"51job 登录 Profile：{settings['user_data_dir']}")
         print(f"51job 登录初始化模式：{settings['login_51job']}")
+    if settings["platform"] == "zhaopin":
+        print(f"Zhaopin Profile: {settings['zhaopin_user_data_dir']}")
+        print(f"Zhaopin login init mode: {settings['login_zhaopin']}")
+    print(f"浏览器后端：{settings['browser_backend']}")
+    if settings["browser_backend"] == "gologin":
+        token_preview = settings.get("gologin_token", "")
+        profile_id = settings.get("gologin_profile_id", "")
+        if token_preview:
+            print(f"Gologin Token：{token_preview[:8]}...（已配置）")
+        if profile_id:
+            print(f"Gologin Profile ID：{profile_id}")
+        else:
+            print("Gologin Profile：自动创建（每次启动生成新指纹）")
+    if settings["browser_backend"] == "adspower":
+        key = settings.get("adspower_api_key", "")
+        port = settings.get("adspower_api_port", "50325")
+        if key:
+            print(f"AdsPower API：已配置（端口 {port}）")
+        else:
+            print(f"AdsPower：手动模式（端口 {port}）")
+    if settings["browser_backend"] == "orbita_cdp":
+        print("Orbita CDP：独立启动 + Playwright 远程连接（无自动化标识条）")
+    print(f"稳妥模式（跳过详情页）：{settings['skip_detail_fetch']}")
     print(f"输出目录：{settings['output_dir']}")
     print(f"已爬取链接目录：{settings['crawled_links_dir']}")
     print(f"批量任务数：{len(settings['keywords']) * len(settings['regions'])}")

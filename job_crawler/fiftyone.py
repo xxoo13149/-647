@@ -6,8 +6,17 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from .browser_backend import launch_persistent_context_with_fallback, using_adspower, using_gologin
 from .constants import FIFTYONE_CITY_CODE_MAP, FIFTYONE_SEARCH_URL
 from .crawled_links import CrawledLinkStore
+from .gologin_backend import (
+    launch_gologin_browser,
+    stop_gologin_api,
+    using_gologin_api,
+    get_gologin_executable_path,
+)
+from .stealth_js import STEALTH_INIT_SCRIPT
+from .adspower_backend import launch_adspower_browser
 from .utils import *  # noqa: F403
 
 try:
@@ -135,8 +144,10 @@ def parse_51job_jobs_from_dom(html: str) -> list[dict[str, Any]]:
         jobs.append(
             {
                 "招聘平台": "51job",
-                "岗位类别/大类": "",
+                "岗位类型一级": "",
+                "岗位类型二级": "",
                 "岗位名称": job_name or "未知岗位",
+                "岗位类型企业/公务员/事业单位/军队文职": "企业",
                 "公司名称": company_name or "未知单位",
                 "公司规模": company_size,
                 "所在省份": infer_province(city),
@@ -149,8 +160,10 @@ def parse_51job_jobs_from_dom(html: str) -> list[dict[str, Any]]:
                 "工作内容": "",
                 "任职要求": "",
                 "岗位链接": detail_url,
+                "发布时间": job_time,
                 "投递起始时间": job_time,
                 "投递截止时间": "",
+                "证书要求": "",
                 "备注": "；".join([x for x in ["公司信息：" + " / ".join(company_meta) if company_meta else ""] if x]),
                 "__工作城市": area,
                 "__详情链接": detail_url,
@@ -253,18 +266,45 @@ async def login_51job_profile(settings: dict[str, Any]) -> None:
     wait_seconds = int(settings["auth_wait_seconds"])
 
     async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(user_data_dir),
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-            ignore_https_errors=True,
-            user_agent=settings["user_agent"],
-            viewport=settings["viewport"],
-            locale="zh-CN",
-        )
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+        gl = None
+        if using_adspower(settings):
+            browser, context, gl = await launch_adspower_browser(p, settings)
+        elif using_gologin_api(settings):
+            # API 模式
+            browser, context, gl = await launch_gologin_browser(p, settings)
+        elif using_gologin(settings):
+            # 本地模式：Orbita 引擎（不传额外 args，Orbita 内置反检测）
+            user_data_dir = Path(settings["user_data_dir"])
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            context = await launch_persistent_context_with_fallback(
+                p.chromium,
+                user_data_dir=user_data_dir,
+                headless=False,
+                executable_path=get_gologin_executable_path(),
+                ignore_https_errors=True,
+                user_agent=settings["user_agent"],
+                viewport=settings["viewport"],
+                locale="zh-CN",
+            )
+            await context.add_init_script(
+                STEALTH_INIT_SCRIPT,
+            )
+        else:
+            user_data_dir = Path(settings["user_data_dir"])
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            context = await launch_persistent_context_with_fallback(
+                p.chromium,
+                user_data_dir=user_data_dir,
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+                ignore_https_errors=True,
+                user_agent=settings["user_agent"],
+                viewport=settings["viewport"],
+                locale="zh-CN",
+            )
+            await context.add_init_script(
+                STEALTH_INIT_SCRIPT,
+            )
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto("https://we.51job.com/pc/login", wait_until="domcontentloaded", timeout=90000)
         print(
@@ -272,8 +312,13 @@ async def login_51job_profile(settings: dict[str, Any]) -> None:
             f"程序将在 {wait_seconds} 秒后保存 Profile 并退出。"
         )
         await asyncio.sleep(wait_seconds)
-        print(f"51job 登录 Profile 已保存：{user_data_dir}")
+        if using_gologin(settings):
+            print(f"51job Gologin session will be saved on stop.")
+        else:
+            print(f"51job 登录 Profile 已保存：{user_data_dir}")
         await context.close()
+        if gl is not None:
+            stop_gologin_api(gl)
 
 
 async def fetch_51job_summary_from_detail_page(
@@ -308,7 +353,7 @@ async def fetch_51job_summary_from_detail_page(
                     )
                     html = await detail_page.content()
                 else:
-                    print(f"51job 详情页触发验证，已跳过：{detail_url}")
+                    emit_task_log(settings, f"51job 详情页触发验证，已跳过：{detail_url}")
                     return ""
 
             summary = extract_51job_detail_summary_from_html(html)
@@ -320,7 +365,7 @@ async def fetch_51job_summary_from_detail_page(
             await human_sleep(*settings["delays"]["detail_retry"])
         except Exception as exc:
             if attempt > max_retries:
-                print(f"51job 详情页抓取失败，已放弃：{detail_url}，原因：{exc}")
+                emit_task_log(settings, f"51job 详情页抓取失败，已放弃：{detail_url}，原因：{exc}")
                 return ""
             await human_sleep(*settings["delays"]["detail_retry"])
 
@@ -332,6 +377,7 @@ async def enrich_51job_jobs_with_detail_summaries(
     jobs: list[dict[str, Any]],
     settings: dict[str, Any],
     crawled_link_store: CrawledLinkStore | None = None,
+    item_callback=None,
 ) -> int:
     """补全 51job 岗位详情。详情页可能需要人工验证。"""
     if not jobs:
@@ -340,21 +386,42 @@ async def enrich_51job_jobs_with_detail_summaries(
     updated_count = 0
     detail_page = await context.new_page()
     try:
-        for item in jobs:
+        total_jobs = len(jobs)
+        for index, item in enumerate(jobs, start=1):
             detail_url = clean_text(str(item.get("__详情链接", "")))
             if not detail_url:
+                if callable(item_callback):
+                    item_callback(item, index)
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
+                    break
                 continue
             if crawled_link_store is not None and crawled_link_store.contains(detail_url):
+                emit_task_log(settings, f"51job 详情链接已抓取过，跳过 ({index}/{total_jobs})：{detail_url}")
+                if callable(item_callback):
+                    item_callback(item, index)
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
+                    break
                 continue
+            if crawled_link_store is not None:
+                if not crawled_link_store.add(detail_url):
+                    emit_task_log(settings, f"51job 详情链接被其他任务记录，跳过 ({index}/{total_jobs})：{detail_url}")
+                    if callable(item_callback):
+                        item_callback(item, index)
+                    if is_cancel_requested(settings):
+                        emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
+                        break
+                    continue
+                crawled_link_store.save()
+            update_task_progress(settings, current_detail_url=detail_url, detail_index=index, detail_total=total_jobs)
+            emit_task_log(settings, f"51job 正在分析详情链接 ({index}/{total_jobs})：{detail_url}")
             summary = await fetch_51job_summary_from_detail_page(
                 detail_page=detail_page,
                 context=context,
                 detail_url=detail_url,
                 settings=settings,
             )
-            if crawled_link_store is not None:
-                crawled_link_store.add(detail_url)
-                crawled_link_store.save()
             if not summary:
                 continue
             work_content, requirement = split_job_summary(summary)
@@ -368,6 +435,11 @@ async def enrich_51job_jobs_with_detail_summaries(
             if changed:
                 updated_count += 1
             await human_sleep(*settings["delays"]["between_details"])
+            if callable(item_callback):
+                item_callback(item, index)
+            if is_cancel_requested(settings):
+                emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
+                break
     finally:
         await detail_page.close()
     return updated_count
@@ -389,25 +461,64 @@ async def crawl_51job(
     seen = set()
 
     async with async_playwright() as p:
-        user_data_dir = Path(settings["user_data_dir"])
-        profile_ready = user_data_dir.exists() and any(user_data_dir.rglob("Cookies"))
-        user_data_dir.mkdir(parents=True, exist_ok=True)
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(user_data_dir),
-            headless=settings["headless"],
-            args=["--disable-blink-features=AutomationControlled"],
-            ignore_https_errors=True,
-            user_agent=settings["user_agent"],
-            viewport=settings["viewport"],
-            locale="zh-CN",
-        )
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+        gl = None
+        if using_adspower(settings):
+            browser, context, gl = await launch_adspower_browser(p, settings)
+            profile_ready = True
+        elif using_gologin_api(settings):
+            # API 模式
+            browser, context, gl = await launch_gologin_browser(p, settings)
+            profile_ready = True
+        elif using_gologin(settings):
+            # 本地模式：Orbita 引擎（不传额外 args，Orbita 内置反检测）
+            user_data_dir = Path(settings["user_data_dir"])
+            profile_ready = user_data_dir.exists() and any(user_data_dir.rglob("Cookies"))
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            context = await launch_persistent_context_with_fallback(
+                p.chromium,
+                user_data_dir=user_data_dir,
+                headless=settings["headless"],
+                executable_path=get_gologin_executable_path(),
+                ignore_https_errors=True,
+                user_agent=settings["user_agent"],
+                viewport=settings["viewport"],
+                locale="zh-CN",
+            )
+            await context.add_init_script(
+                STEALTH_INIT_SCRIPT,
+            )
+        else:
+            user_data_dir = Path(settings["user_data_dir"])
+            profile_ready = user_data_dir.exists() and any(user_data_dir.rglob("Cookies"))
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            context = await launch_persistent_context_with_fallback(
+                p.chromium,
+                user_data_dir=user_data_dir,
+                headless=settings["headless"],
+                args=["--disable-blink-features=AutomationControlled"],
+                ignore_https_errors=True,
+                user_agent=settings["user_agent"],
+                viewport=settings["viewport"],
+                locale="zh-CN",
+            )
+            await context.add_init_script(
+                STEALTH_INIT_SCRIPT,
+            )
         page = context.pages[0] if context.pages else await context.new_page()
 
         try:
-            print(f"开始抓取 51job：关键词={keyword}，地区={city}")
+            region_label = city or "不限地区"
+            update_task_progress(
+                settings,
+                platform="51job",
+                keyword=keyword,
+                region=region_label,
+                page=1,
+                total_pages=settings["max_pages_per_region"],
+                cumulative_count=0,
+                current_detail_url="",
+            )
+            emit_task_log(settings, f"开始抓取 51job：关键词={keyword}，地区={region_label}")
             await search_51job_keyword(
                 page=page,
                 keyword=keyword,
@@ -431,12 +542,29 @@ async def crawl_51job(
 
             current_page = 1
             while current_page <= settings["max_pages_per_region"]:
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "收到中止请求，停止读取新的页面。")
+                    break
+                update_task_progress(
+                    settings,
+                    platform="51job",
+                    keyword=keyword,
+                    region=region_label,
+                    page=current_page,
+                    total_pages=settings["max_pages_per_region"],
+                    current_detail_url="",
+                )
+                emit_task_log(
+                    settings,
+                    f"51job 正在读取第 {current_page}/{settings['max_pages_per_region']} 页："
+                    f"关键词={keyword}，地区={region_label}",
+                )
                 await human_sleep(*settings["delays"]["between_pages"])
                 html = await page.content()
                 raw_page_jobs = parse_51job_jobs_from_dom(html)
 
                 if not raw_page_jobs:
-                    print(f"51job 第 {current_page} 页未解析到岗位，停止当前搜索。")
+                    emit_task_log(settings, f"51job 第 {current_page} 页未解析到岗位，停止当前搜索。")
                     break
 
                 page_jobs = [
@@ -445,22 +573,55 @@ async def crawl_51job(
                     if is_job_in_target_city(str(item.get("__工作城市", "")), city)
                 ]
                 filtered_count = len(raw_page_jobs) - len(page_jobs)
+                filter_text = "未进行地区过滤" if not city else f"过滤非目标地区 {filtered_count} 条"
+                update_task_progress(
+                    settings,
+                    parsed_count=len(raw_page_jobs),
+                    kept_count=len(page_jobs),
+                    filtered_count=filtered_count,
+                    cumulative_count=len(jobs),
+                )
+                emit_task_log(
+                    settings,
+                    f"51job 第 {current_page} 页解析到 {len(raw_page_jobs)} 条，"
+                    f"{filter_text}，准备处理 {len(page_jobs)} 条。",
+                )
 
                 new_count = 0
-                for item in page_jobs:
+                page_result_callback = settings.get("page_result_callback")
+
+                def handle_processed_item(item, detail_index=None):
+                    nonlocal new_count
                     if not clean_text(str(item.get("岗位类别/大类", ""))):
-                        item["岗位类别/大类"] = keyword
+                        item["岗位类型一级"] = keyword
+                    detail_link = clean_text(str(item.get("岗位链接", "")))
                     key = (
-                        item["公司名称"],
-                        item["岗位名称"],
-                        item.get("城市", ""),
-                        item.get("岗位链接", ""),
+                        ("link", detail_link)
+                        if detail_link
+                        else (
+                            "fallback",
+                            item["公司名称"],
+                            item["岗位名称"],
+                            item.get("城市", ""),
+                        )
                     )
                     if key in seen:
-                        continue
+                        return
                     seen.add(key)
                     jobs.append(item)
                     new_count += 1
+                    if callable(page_result_callback):
+                        page_result_callback(
+                            keyword,
+                            [item],
+                            {
+                                "platform": "51job",
+                                "region": region_label,
+                                "page": current_page,
+                                "total_pages": settings["max_pages_per_region"],
+                                "detail_index": detail_index,
+                            },
+                        )
 
                 if profile_ready:
                     detail_updated = await enrich_51job_jobs_with_detail_summaries(
@@ -468,30 +629,46 @@ async def crawl_51job(
                         jobs=page_jobs,
                         settings=settings,
                         crawled_link_store=crawled_link_store,
+                        item_callback=handle_processed_item,
                     )
                 else:
                     detail_updated = 0
+                    for index, item in enumerate(page_jobs, start=1):
+                        handle_processed_item(item, index)
+                        if is_cancel_requested(settings):
+                            emit_cancel_log_once(settings, "收到中止请求，当前岗位已写入，停止继续处理剩余岗位。")
+                            break
 
-                print(
+                emit_task_log(
+                    settings,
                     f"51job 第 {current_page} 页：解析 {len(raw_page_jobs)} 条，"
-                    f"过滤非目标地区 {filtered_count} 条，详情补全 {detail_updated} 条，"
+                    f"{filter_text}，详情补全 {detail_updated} 条，"
                     f"新增 {new_count} 条（累计 {len(jobs)} 条）"
                 )
+                update_task_progress(settings, cumulative_count=len(jobs), current_detail_url="")
+
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "收到中止请求，当前页已处理完成，停止继续翻页。")
+                    break
 
                 if current_page >= settings["max_pages_per_region"]:
                     break
 
                 next_buttons = page.get_by_text("下一页", exact=True)
                 if await next_buttons.count() == 0:
+                    emit_task_log(settings, "51job 已到最后一页。")
                     break
                 try:
                     await next_buttons.first.click(timeout=5000)
                 except Exception:
+                    emit_task_log(settings, "51job 点击下一页失败，结束当前搜索。")
                     break
                 await human_sleep(*settings["delays"]["after_next_page"])
                 current_page += 1
 
         finally:
             await context.close()
+            if gl is not None:
+                stop_gologin_api(gl)
 
     return jobs

@@ -48,14 +48,31 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auth_state_path": "auth/51job_state.json",
     "login_51job": False,
     "user_data_dir": "auth/51job_profile",
+    "login_zhaopin": False,
+    "zhaopin_user_data_dir": "auth/zhaopin_profile",
+    "browser_backend": "playwright",
+    "gologin_token": "",
+    "gologin_profile_id": "",
+    "adspower_api_key": "",
+    "adspower_api_port": "50325",
+    "scrapling_real_chrome": False,
+    "scrapling_google_search": False,
+    "scrapling_block_webrtc": True,
+    "scrapling_hide_canvas": True,
+    "skip_detail_fetch": True,
+    "auto_restart_on_verify": False,
+    "max_restart_attempts": 3,
+    "yescaptcha_proxy": "",
 }
 
 EMPTY_CELL_VALUE = "/"
 
 OUTPUT_COLUMNS = [
     "招聘平台",
-    "岗位类别/大类",
+    "岗位类型一级",
+    "岗位类型二级",
     "岗位名称",
+    "岗位类型企业/公务员/事业单位/军队文职",
     "公司名称",
     "公司规模",
     "所在省份",
@@ -68,8 +85,10 @@ OUTPUT_COLUMNS = [
     "工作内容",
     "任职要求",
     "岗位链接",
+    "发布时间",
     "投递起始时间",
     "投递截止时间",
+    "证书要求",
     "备注",
 ]
 

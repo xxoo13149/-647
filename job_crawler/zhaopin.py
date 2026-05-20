@@ -4,13 +4,44 @@ import json
 import random
 import re
 import urllib.parse
+from pathlib import Path
 from typing import Any
 
 from bs4 import BeautifulSoup
 
+from .browser_backend import (
+    fetch_html_with_scrapling,
+    launch_persistent_context_with_fallback,
+    using_adspower,
+    using_gologin,
+    using_orbita_cdp,
+    using_scrapling,
+)
 from .constants import DEFAULT_CONFIG, ZHAOPIN_SEARCH_URL
 from .crawled_links import CrawledLinkStore
+from .gologin_backend import (
+    launch_gologin_browser,
+    stop_gologin_api,
+    using_gologin_api,
+    get_gologin_executable_path,
+)
+from .stealth_js import STEALTH_INIT_SCRIPT
+from .adspower_backend import launch_adspower_browser
+from .orbita_cdp_backend import launch_orbita_browser, stop_orbita_browser, connect_playwright_to_orbita
 from .utils import *  # noqa: F403
+
+try:
+    from .yescaptcha import (
+        describe_captcha_context,
+        detect_captcha_context,
+        is_yescaptcha_configured,
+        solve_zhaopin_captcha,
+    )
+except ImportError:
+    solve_zhaopin_captcha = None
+    is_yescaptcha_configured = None
+    detect_captcha_context = None
+    describe_captcha_context = None
 
 try:
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -18,6 +49,23 @@ try:
 except ImportError:
     PlaywrightTimeoutError = TimeoutError
     async_playwright = None
+
+
+ZHAOPIN_SEARCH_WAIT_SELECTOR = "div.joblist-box__item, input.query-search__content-input"
+ZHAOPIN_DETAIL_WAIT_SELECTOR = (
+    "div.describtion-card__detail-content, "
+    "div.jobdetail-box__content, "
+    "div.describtion__detail-content, "
+    "div.jobdetail__content, "
+    "div.job-detail, "
+    "div.job-description, "
+    "section.jobdetail__content, "
+    "div.jobrequirement"
+)
+
+
+class ZhaopinRateLimitError(RuntimeError):
+    """Raised when Zhaopin returns a frequency-control page that cannot be manually cleared."""
 
 
 def build_detail_address_from_state_item(item: dict[str, Any]) -> str:
@@ -65,8 +113,14 @@ def extract_initial_state(html: str) -> dict:
 
 
 def build_search_url(keyword: str, city_name: str, page: int = 1) -> str:
-    """构造智联搜索 URL，使用城市名称直接搜索（无需 code）。"""
-    params = {"jl": city_name, "kw": keyword, "p": str(page)}
+    """构造智联搜索 URL，使用城市名称直接搜索（无需 code）。
+    
+    city_name 为 "全国" 或空字符串时不限制地区。
+    """
+    params = {"kw": keyword, "p": str(page)}
+    normalized_city = city_name.strip()
+    if normalized_city and normalized_city != "全国":
+        params["jl"] = normalized_city
     return f"{ZHAOPIN_SEARCH_URL}?{urllib.parse.urlencode(params)}"
 
 
@@ -348,8 +402,10 @@ def parse_jobs_from_state(state: dict) -> list[dict]:
         jobs.append(
             {
                 "招聘平台": "智联招聘",
-                "岗位类别/大类": "",
+                "岗位类型一级": "",
+                "岗位类型二级": "",
                 "岗位名称": job_name,
+                "岗位类型企业/公务员/事业单位/军队文职": "企业",
                 "公司名称": company_name,
                 "公司规模": company_size,
                 "所在省份": infer_province(work_city),
@@ -362,8 +418,10 @@ def parse_jobs_from_state(state: dict) -> list[dict]:
                 "工作内容": work_content,
                 "任职要求": requirement,
                 "岗位链接": detail_url,
+                "发布时间": latest_publish_time,
                 "投递起始时间": latest_publish_time,
                 "投递截止时间": "",
+                "证书要求": "",
                 "备注": "；".join(remark_parts),
                 "__工作城市": work_city,
                 "__详情链接": detail_url,
@@ -424,8 +482,10 @@ def parse_jobs_from_dom(html: str) -> list[dict]:
         jobs.append(
             {
                 "招聘平台": "智联招聘",
-                "岗位类别/大类": "",
+                "岗位类型一级": "",
+                "岗位类型二级": "",
                 "岗位名称": job_name,
+                "岗位类型企业/公务员/事业单位/军队文职": "企业",
                 "公司名称": company_name,
                 "公司规模": company_size,
                 "所在省份": infer_province(city),
@@ -438,8 +498,10 @@ def parse_jobs_from_dom(html: str) -> list[dict]:
                 "工作内容": "",
                 "任职要求": "",
                 "岗位链接": detail_url,
+                "发布时间": latest_publish_time,
                 "投递起始时间": latest_publish_time,
                 "投递截止时间": "",
+                "证书要求": "",
                 "备注": "；".join(remark_parts),
                 "__工作城市": location,
                 "__详情链接": detail_url,
@@ -466,13 +528,21 @@ def extract_next_page_url(html: str, base_url: str = "https://www.zhaopin.com") 
     return ""
 
 
-def looks_like_verification_page(html: str) -> bool:
-    """判断是否进入了验证页（使用强特征，避免误判普通职位页）。"""
+def classify_zhaopin_access_page(html: str) -> str:
+    """识别智联中间拦截页类型：none / verification / rate_limited。"""
     soup = BeautifulSoup(html, "html.parser")
-
     title_text = clean_text(soup.title.get_text()) if soup.title else ""
+    body_text = clean_text(soup.get_text(" ", strip=True))
+    lowered_title = title_text.lower()
+
+    if any(sig in body_text for sig in ["操作过于频繁", "请稍后再试", "稍后再试"]):
+        return "rate_limited"
+
+    if "security verification" in lowered_title:
+        return "verification"
+
     if any(sig in title_text for sig in ["安全验证", "行为验证", "验证码"]):
-        return True
+        return "verification"
 
     # 腾讯验证码通常会以内嵌 iframe 或容器出现。
     captcha_nodes = soup.select(
@@ -484,17 +554,246 @@ def looks_like_verification_page(html: str) -> bool:
         "div[class*='geetest']"
     )
     if captcha_nodes:
-        return True
+        return "verification"
 
     # 普通职位页至少会有 root 容器或岗位卡片；两者都缺失时更可能是拦截页。
     has_root = bool(soup.select_one("#root"))
     has_cards = bool(soup.select("div.joblist-box__item"))
     if not has_root and not has_cards:
-        body_text = soup.get_text(" ", strip=True)
         if any(sig in body_text for sig in ["请完成验证", "验证后继续", "点击完成验证"]):
+            return "verification"
+
+    return "none"
+
+
+def looks_like_rate_limit_page(html: str) -> bool:
+    return classify_zhaopin_access_page(html) == "rate_limited"
+
+
+def looks_like_verification_page(html: str) -> bool:
+    """判断是否进入了验证/频控拦截页。"""
+    return classify_zhaopin_access_page(html) != "none"
+
+
+def can_wait_for_zhaopin_auth(settings: dict[str, Any]) -> bool:
+    return bool(settings.get("manual_auth") or not settings.get("headless", True))
+
+
+async def looks_like_zhaopin_logged_in(page) -> bool:
+    """Best-effort check for an existing Zhaopin login session."""
+    page_url = clean_text(getattr(page, "url", ""))
+    if "passport.zhaopin.com" in page_url or "/login" in page_url:
+        return False
+
+    html = ""
+    try:
+        html = await page.content()
+    except Exception:
+        pass
+
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        body_text = clean_text(soup.get_text(" ", strip=True))
+        if any(sig in body_text for sig in ["退出", "我的智联", "个人中心", "消息中心", "我的简历"]):
+            return True
+        if any(sig in body_text for sig in ["登录", "注册"]) and not any(
+            sig in body_text for sig in ["退出", "我的智联", "个人中心"]
+        ):
+            return False
+
+    try:
+        cookies = await page.context.cookies()
+    except Exception:
+        cookies = []
+
+    for cookie in cookies:
+        domain = clean_text(str(cookie.get("domain", ""))).lower()
+        name = clean_text(str(cookie.get("name", ""))).lower()
+        if "zhaopin.com" in domain and any(token in name for token in ("ticket", "token", "session", "sid", "auth")):
             return True
 
     return False
+
+
+async def wait_for_manual_zhaopin_auth(
+    page,
+    settings: dict[str, Any],
+    reason: str,
+    target_url: str = "",
+) -> bool:
+    """Pause for a human to finish Zhaopin's verification in the visible browser.
+    
+    优先尝试使用 YesCaptcha 自动解决验证码，失败后回退到人工验证。
+    """
+    if settings.get("headless", True):
+        raise RuntimeError(
+            "Zhaopin verification appeared in headless mode. "
+            "Run once with --login-zhaopin, or crawl with --headed and MANUAL_AUTH=true."
+        )
+
+    try:
+        initial_html = await page.content()
+    except Exception:
+        initial_html = ""
+    if initial_html and looks_like_rate_limit_page(initial_html):
+        raise ZhaopinRateLimitError("当前会话触发智联频控，页面提示“操作过于频繁，请稍后再试”。")
+    if detect_captcha_context and describe_captcha_context:
+        try:
+            context = detect_captcha_context(initial_html, page.url)
+            emit_task_log(settings, f"Zhaopin verification diagnostics: {describe_captcha_context(context)}")
+        except Exception as exc:
+            emit_task_log(settings, f"Zhaopin verification diagnostics failed: {exc}")
+
+
+    # 优先尝试自动验证码解决
+    if solve_zhaopin_captcha and is_yescaptcha_configured(settings):
+        emit_task_log(
+            settings,
+            f"Zhaopin needs verification: {reason}. "
+            "Attempting automatic captcha solving with YesCaptcha..."
+        )
+        try:
+            success = await solve_zhaopin_captcha(page, settings)
+            if success:
+                emit_task_log(settings, "YesCaptcha automatic verification successful; resuming.")
+                await asyncio.sleep(2)
+                # 验证页面是否已通过
+                html = await page.content()
+                if classify_zhaopin_access_page(html) == "none":
+                    return True
+                emit_task_log(settings, "YesCaptcha solved but page still shows verification, falling back to manual.")
+            else:
+                emit_task_log(settings, "YesCaptcha automatic verification failed, falling back to manual.")
+        except Exception as e:
+            emit_task_log(settings, f"YesCaptcha error: {e}, falling back to manual verification.")
+    else:
+        configured = bool(is_yescaptcha_configured(settings)) if is_yescaptcha_configured else False
+        emit_task_log(
+            settings,
+            f"YesCaptcha branch skipped: solver_loaded={bool(solve_zhaopin_captcha)}, configured={configured}.",
+        )
+
+
+    # 回退到人工验证
+    emit_task_log(
+        settings,
+        f"Zhaopin needs manual verification: {reason}. "
+        "Please finish it in the opened browser; the task will resume automatically after verification.",
+    )
+
+    waiting_logged = False
+    while True:
+        await asyncio.sleep(3)
+        if is_cancel_requested(settings):
+            emit_task_log(settings, "Manual verification wait stopped because the task was cancelled.")
+            return False
+        try:
+            html = await page.content()
+            gate_kind = classify_zhaopin_access_page(html)
+            if gate_kind == "rate_limited":
+                raise ZhaopinRateLimitError("当前会话触发智联频控，页面提示“操作过于频繁，请稍后再试”。")
+            if gate_kind == "none":
+                if target_url and page.url != target_url:
+                    try:
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+                        await human_sleep(*settings["delays"]["after_open_detail"])
+                    except Exception as exc:
+                        emit_task_log(settings, f"Verification finished, but reopening the original page failed: {exc}")
+                emit_task_log(settings, "Zhaopin manual verification appears complete; resuming.")
+                return True
+            if not waiting_logged:
+                emit_task_log(settings, "Verification page is still active. Waiting for manual completion.")
+                waiting_logged = True
+        except ZhaopinRateLimitError:
+            raise
+        except Exception:
+            pass
+
+
+async def login_zhaopin_profile(settings: dict[str, Any]) -> None:
+    """Open a persistent Zhaopin browser profile for manual verification/login."""
+    if async_playwright is None:
+        raise RuntimeError(
+            "缺少 Playwright 依赖，请先运行：pip install -r requirements.txt && playwright install chromium"
+        )
+
+    user_data_dir = Path(settings["zhaopin_user_data_dir"])
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    wait_seconds = int(settings["auth_wait_seconds"])
+
+    async with async_playwright() as p:
+        gl = None
+        proc = None
+        if using_orbita_cdp(settings):
+            orbita_exe = get_gologin_executable_path()
+            proc, ws_url = await launch_orbita_browser(orbita_exe, settings["zhaopin_user_data_dir"], headless=False)
+            browser, context = await connect_playwright_to_orbita(p, ws_url)
+        elif using_adspower(settings):
+            # API 模式
+            browser, context, gl = await launch_gologin_browser(p, settings)
+        elif using_gologin(settings):
+            # 本地模式：Orbita 引擎（不传额外 args，Orbita 内置反检测）
+            user_data_dir = Path(settings["zhaopin_user_data_dir"])
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            context = await launch_persistent_context_with_fallback(
+                p.chromium,
+                user_data_dir=user_data_dir,
+                headless=False,
+                executable_path=get_gologin_executable_path(),
+                ignore_https_errors=True,
+                user_agent=settings["user_agent"],
+                viewport=settings["viewport"],
+                locale="zh-CN",
+            )
+        else:
+            user_data_dir = Path(settings["zhaopin_user_data_dir"])
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            context = await launch_persistent_context_with_fallback(
+                p.chromium,
+                user_data_dir=user_data_dir,
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+                ignore_https_errors=True,
+                user_agent=settings["user_agent"],
+                viewport=settings["viewport"],
+                locale="zh-CN",
+            )
+        await context.add_init_script(
+            STEALTH_INIT_SCRIPT,
+        )
+
+        # Orbita 浏览器兼容：直接用已有页面，不关闭重建
+        page = context.pages[0] if context.pages else await context.new_page()
+        home_url = "https://www.zhaopin.com"
+        login_url = "https://passport.zhaopin.com/login?BkUrl=https%3A%2F%2Fwww.zhaopin.com"
+
+        await page.goto(home_url, wait_until="domcontentloaded", timeout=90000)
+        await page.bring_to_front()
+        await asyncio.sleep(2)
+
+        if await looks_like_zhaopin_logged_in(page):
+            print(
+                "Detected an existing Zhaopin login session. "
+                "Staying on https://www.zhaopin.com and saving the profile."
+            )
+        else:
+            await page.goto(login_url, wait_until="domcontentloaded", timeout=90000)
+            await page.bring_to_front()
+            print(
+                "Opened Zhaopin login page. Finish login/verification in the browser; "
+                f"the profile will be saved after {wait_seconds} seconds."
+            )
+
+        await asyncio.sleep(wait_seconds)
+        if using_gologin(settings):
+            print(f"Zhaopin Gologin session will be saved on stop.")
+        else:
+            print(f"Zhaopin browser profile saved at: {user_data_dir}")
+        await context.close()
+        if proc is not None:
+            stop_orbita_browser(proc)
+        elif gl is not None:
+            stop_gologin_api(gl)
 
 
 async def search_keyword(page, keyword: str) -> None:
@@ -515,8 +814,29 @@ async def fetch_job_summary_from_detail_page(
 ) -> str:
     """抓取职位详情页并提取完整岗位摘要。"""
     max_retries = settings["max_detail_retries"]
+    if using_scrapling(settings):
+        try:
+            scrapling_html = await fetch_html_with_scrapling(
+                detail_url,
+                settings=settings,
+                wait_selector=ZHAOPIN_DETAIL_WAIT_SELECTOR,
+                profile_dir=settings["zhaopin_user_data_dir"],
+                wait_ms=int(float(settings["delays"]["after_open_detail"][1]) * 1000),
+            )
+            if scrapling_html and not looks_like_verification_page(scrapling_html):
+                summary = extract_job_summary_from_detail_html(scrapling_html)
+                if summary:
+                    emit_task_log(settings, f"Scrapling loaded Zhaopin detail page: {detail_url}")
+                    return summary
+                emit_task_log(settings, f"Scrapling opened detail page but did not extract summary: {detail_url}")
+            elif scrapling_html:
+                emit_task_log(settings, f"Scrapling hit verification on detail page; switching to Playwright: {detail_url}")
+        except Exception as exc:
+            emit_task_log(settings, f"Scrapling detail fetch failed, falling back to Playwright: {exc}")
     for attempt in range(1, max_retries + 2):
         try:
+            if settings.get("_zhaopin_skip_detail_fetch"):
+                return ""
             await human_sleep(*settings["delays"]["before_open_detail"])
             await detail_page.goto(
                 detail_url,
@@ -527,20 +847,42 @@ async def fetch_job_summary_from_detail_page(
 
             html = await detail_page.content()
             if looks_like_verification_page(html):
-                raise RuntimeError("详情页疑似触发验证")
+                if can_wait_for_zhaopin_auth(settings):
+                    try:
+                        verified = await wait_for_manual_zhaopin_auth(
+                            detail_page,
+                            settings,
+                            reason=f"detail page verification: {detail_url}",
+                            target_url=detail_url,
+                        )
+                    except ZhaopinRateLimitError as exc:
+                        settings["_zhaopin_skip_detail_fetch"] = True
+                        settings["_zhaopin_skip_detail_reason"] = str(exc)
+                        emit_task_log(
+                            settings,
+                            "详情页触发智联频控，后续详情补全将先跳过，继续导出列表页结果。"
+                        )
+                        emit_task_log(settings, f"频控详情：{exc}")
+                        return ""
+                    if not verified and is_cancel_requested(settings):
+                        return ""
+                    if verified:
+                        html = await detail_page.content()
+                if looks_like_verification_page(html):
+                    raise RuntimeError("Zhaopin detail page still needs verification")
 
             summary = extract_job_summary_from_detail_html(html)
             if summary:
                 return summary
 
             if attempt > max_retries:
-                print(f"详情页未提取到岗位摘要，已放弃：{detail_url}")
+                emit_task_log(settings, f"详情页未提取到岗位摘要，已放弃：{detail_url}")
                 return ""
 
             raise RuntimeError("详情页未提取到岗位摘要")
         except Exception as exc:
             if attempt > max_retries:
-                print(f"详情页抓取失败，已放弃：{detail_url}，原因：{exc}")
+                emit_task_log(settings, f"详情页抓取失败，已放弃：{detail_url}，原因：{exc}")
                 return ""
 
             retry_delay = scale_retry_delay(
@@ -549,7 +891,8 @@ async def fetch_job_summary_from_detail_page(
                 backoff_factor=settings["retry_backoff_factor"],
                 max_seconds=settings["max_retry_delay_seconds"],
             )
-            print(
+            emit_task_log(
+                settings,
                 f"详情页抓取异常，准备重试（{attempt}/{max_retries}）：{detail_url}，原因：{exc}"
             )
             await human_sleep(*retry_delay)
@@ -563,6 +906,7 @@ async def enrich_jobs_with_detail_summaries(
     settings: dict[str, Any],
     summary_cache: dict[str, str],
     crawled_link_store: CrawledLinkStore | None = None,
+    item_callback=None,
 ) -> int:
     """逐条访问详情页，补全能力描述中的岗位摘要。"""
     if not jobs:
@@ -572,27 +916,66 @@ async def enrich_jobs_with_detail_summaries(
     detail_page = await context.new_page()
 
     try:
-        for item in jobs:
+        total_jobs = len(jobs)
+        for index, item in enumerate(jobs, start=1):
+            if settings.get("_zhaopin_skip_detail_fetch"):
+                if not settings.get("_zhaopin_skip_detail_logged"):
+                    reason = clean_text(str(settings.get("_zhaopin_skip_detail_reason", ""))) or "详情页访问已被智联限制"
+                    emit_task_log(
+                        settings,
+                        f"详情页补全已降级：{reason}。后续岗位先保留列表页字段并继续写入 Excel。"
+                    )
+                    settings["_zhaopin_skip_detail_logged"] = True
+                if callable(item_callback):
+                    item_callback(item, index)
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
+                    break
+                continue
             detail_url = clean_text(str(item.get("__详情链接", "")))
             if not detail_url:
+                if callable(item_callback):
+                    item_callback(item, index)
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
+                    break
                 continue
             if crawled_link_store is not None and crawled_link_store.contains(detail_url):
+                emit_task_log(settings, f"详情链接已抓取过，跳过 ({index}/{total_jobs})：{detail_url}")
+                if callable(item_callback):
+                    item_callback(item, index)
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
+                    break
                 continue
 
             fetched_from_network = False
             if detail_url in summary_cache:
                 full_summary = summary_cache[detail_url]
+                emit_task_log(settings, f"使用详情缓存 ({index}/{total_jobs})：{detail_url}")
+                if crawled_link_store is not None:
+                    crawled_link_store.add(detail_url)
+                    crawled_link_store.save()
             else:
                 fetched_from_network = True
+                update_task_progress(settings, current_detail_url=detail_url, detail_index=index, detail_total=total_jobs)
+                emit_task_log(settings, f"正在分析详情链接 ({index}/{total_jobs})：{detail_url}")
+                if crawled_link_store is not None:
+                    if not crawled_link_store.add(detail_url):
+                        emit_task_log(settings, f"详情链接被其他任务记录，跳过 ({index}/{total_jobs})：{detail_url}")
+                        if callable(item_callback):
+                            item_callback(item, index)
+                        if is_cancel_requested(settings):
+                            emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
+                            break
+                        continue
+                    crawled_link_store.save()
                 full_summary = await fetch_job_summary_from_detail_page(
                     detail_page=detail_page,
                     detail_url=detail_url,
                     settings=settings,
                 )
                 summary_cache[detail_url] = full_summary
-                if crawled_link_store is not None:
-                    crawled_link_store.add(detail_url)
-                    crawled_link_store.save()
 
             if full_summary:
                 work_content, requirement = split_job_summary(full_summary)
@@ -609,6 +992,11 @@ async def enrich_jobs_with_detail_summaries(
 
             if fetched_from_network:
                 await human_sleep(*settings["delays"]["between_details"])
+            if callable(item_callback):
+                item_callback(item, index)
+            if is_cancel_requested(settings):
+                emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
+                break
     finally:
         await detail_page.close()
 
@@ -625,11 +1013,9 @@ async def search_keyword_in_city(
     """按关键词 + 城市名称直达搜索页，确保输入岗位和地区同时生效。"""
     target_url = build_search_url(keyword=keyword, city_name=city_name, page=1)
     try:
-        await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
-        print(f"首次请求出现异常（可能网络波动）：{e}，正在重试...")
-        await asyncio.sleep(3.0)
-        await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+        print(f"导航到搜索页超时/失败（可能触发验证）：{e}")
 
     await human_sleep(*delay)
 
@@ -661,6 +1047,48 @@ async def search_keyword_in_city(
         return
 
 
+async def load_zhaopin_search_html(
+    page,
+    keyword: str,
+    city_name: str,
+    settings: dict[str, Any],
+    page_number: int = 1,
+) -> str:
+    target_url = build_search_url(keyword=keyword, city_name=city_name, page=page_number)
+    if using_scrapling(settings):
+        try:
+            html = await fetch_html_with_scrapling(
+                target_url,
+                settings=settings,
+                wait_selector=ZHAOPIN_SEARCH_WAIT_SELECTOR,
+                profile_dir=settings["zhaopin_user_data_dir"],
+            )
+            if html and not looks_like_verification_page(html):
+                emit_task_log(settings, f"Search page {page_number} loaded with Scrapling backend.")
+                return html
+            if html:
+                emit_task_log(settings, f"Scrapling hit verification on search page {page_number}; falling back to Playwright.")
+        except Exception as exc:
+            emit_task_log(settings, f"Scrapling backend failed on search page {page_number}, falling back to Playwright: {exc}")
+
+    if page_number == 1:
+        await search_keyword_in_city(
+            page,
+            keyword=keyword,
+            city_name=city_name,
+            delay=settings["delays"]["after_open_search"],
+            typing_delay_ms=settings["typing_delay_ms"],
+        )
+    else:
+        target_url = build_search_url(keyword=keyword, city_name=city_name, page=page_number)
+        try:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:
+            emit_task_log(settings, f"Playwright navigation failed on search page {page_number}: {exc}")
+            return ""
+    return await page.content()
+
+
 async def crawl_zhaopin(
     keyword: str,
     city: str,
@@ -678,33 +1106,109 @@ async def crawl_zhaopin(
     detail_summary_cache: dict[str, str] = {}
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=settings["headless"])
-        context = await browser.new_context(
-            ignore_https_errors=True,
-            user_agent=settings["user_agent"],
-            viewport=settings["viewport"],
-        )
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-
-        page = await context.new_page()
-
-        try:
-            print(f"开始抓取：关键词={keyword}，地区={city}")
-            await search_keyword_in_city(
-                page,
-                keyword=keyword,
-                city_name=city,
-                delay=settings["delays"]["after_open_search"],
-                typing_delay_ms=settings["typing_delay_ms"],
+        gl = None
+        proc = None
+        if using_orbita_cdp(settings):
+            orbita_exe = get_gologin_executable_path()
+            proc, ws_url = await launch_orbita_browser(orbita_exe, settings["zhaopin_user_data_dir"], headless=settings["headless"])
+            browser, context = await connect_playwright_to_orbita(p, ws_url)
+        elif using_adspower(settings):
+            # API 模式：完整指纹伪装
+            browser, context, gl = await launch_gologin_browser(p, settings)
+        elif using_gologin(settings):
+            # 本地模式：Orbita 引擎（不传额外 args，Orbita 内置反检测）
+            zhaopin_user_data_dir = Path(settings["zhaopin_user_data_dir"])
+            zhaopin_user_data_dir.mkdir(parents=True, exist_ok=True)
+            context = await launch_persistent_context_with_fallback(
+                p.chromium,
+                user_data_dir=zhaopin_user_data_dir,
+                headless=settings["headless"],
+                executable_path=get_gologin_executable_path(),
+                ignore_https_errors=True,
+                user_agent=settings["user_agent"],
+                viewport=settings["viewport"],
+                locale="zh-CN",
+            )
+            await context.add_init_script(
+                STEALTH_INIT_SCRIPT,
+            )
+        else:
+            zhaopin_user_data_dir = Path(settings["zhaopin_user_data_dir"])
+            zhaopin_user_data_dir.mkdir(parents=True, exist_ok=True)
+            context = await launch_persistent_context_with_fallback(
+                p.chromium,
+                user_data_dir=zhaopin_user_data_dir,
+                headless=settings["headless"],
+                args=["--disable-blink-features=AutomationControlled"],
+                ignore_https_errors=True,
+                user_agent=settings["user_agent"],
+                viewport=settings["viewport"],
+                locale="zh-CN",
+            )
+            await context.add_init_script(
+                STEALTH_INIT_SCRIPT,
             )
 
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        try:
+            region_label = city or "不限地区"
+            update_task_progress(
+                settings,
+                platform="zhaopin",
+                keyword=keyword,
+                region=region_label,
+                page=1,
+                total_pages=settings["max_pages_per_region"],
+                cumulative_count=0,
+                current_detail_url="",
+            )
+            emit_task_log(settings, f"开始抓取智联招聘：关键词={keyword}，地区={region_label}")
             current_page = 1
             empty_retry_count = 0
             while current_page <= settings["max_pages_per_region"]:
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "收到中止请求，停止读取新的页面。")
+                    break
+                update_task_progress(
+                    settings,
+                    platform="zhaopin",
+                    keyword=keyword,
+                    region=region_label,
+                    page=current_page,
+                    total_pages=settings["max_pages_per_region"],
+                    current_detail_url="",
+                )
+                emit_task_log(
+                    settings,
+                    f"正在读取第 {current_page}/{settings['max_pages_per_region']} 页："
+                    f"关键词={keyword}，地区={region_label}",
+                )
+                html = await load_zhaopin_search_html(
+                    page=page,
+                    keyword=keyword,
+                    city_name=city,
+                    settings=settings,
+                    page_number=current_page,
+                )
                 await human_sleep(*settings["delays"]["between_pages"])
-                html = await page.content()
+                if looks_like_verification_page(html) and can_wait_for_zhaopin_auth(settings):
+                    current_url = build_search_url(keyword=keyword, city_name=city, page=current_page)
+                    try:
+                        verified = await wait_for_manual_zhaopin_auth(
+                            page,
+                            settings,
+                            reason=f"search result page {current_page}",
+                            target_url=current_url,
+                        )
+                    except ZhaopinRateLimitError as exc:
+                        emit_task_log(settings, f"搜索结果页触发智联频控：{exc}")
+                        emit_task_log(settings, "当前关键词已停止继续抓取，请稍后再试或更换会话环境。")
+                        break
+                    if not verified and is_cancel_requested(settings):
+                        break
+                    if verified:
+                        html = await page.content()
 
                 state = extract_initial_state(html)
                 raw_page_jobs = parse_jobs_from_state(state)
@@ -715,12 +1219,14 @@ async def crawl_zhaopin(
                     empty_retry_count += 1
                     if empty_retry_count <= settings["max_empty_page_retries"]:
                         if looks_like_verification_page(html):
-                            print(
+                            emit_task_log(
+                                settings,
                                 f"第 {current_page} 页疑似触发验证，"
                                 f"自动重试（{empty_retry_count}/{settings['max_empty_page_retries']}）..."
                             )
                         else:
-                            print(
+                            emit_task_log(
+                                settings,
                                 f"第 {current_page} 页暂未解析到岗位，"
                                 f"自动重试（{empty_retry_count}/{settings['max_empty_page_retries']}）..."
                             )
@@ -732,10 +1238,10 @@ async def crawl_zhaopin(
                             max_seconds=settings["max_retry_delay_seconds"],
                         )
                         await human_sleep(*retry_delay)
-                        await page.reload(wait_until="domcontentloaded", timeout=90000)
                         continue
 
-                    print(
+                    emit_task_log(
+                        settings,
                         f"第 {current_page} 页连续 {settings['max_empty_page_retries']} 次未解析到岗位，"
                         "已停止继续翻页，保留已抓取数据。"
                     )
@@ -749,71 +1255,116 @@ async def crawl_zhaopin(
                     if is_job_in_target_city(str(item.get("__工作城市", "")), city)
                 ]
                 filtered_count = len(raw_page_jobs) - len(page_jobs)
+                update_task_progress(
+                    settings,
+                    parsed_count=len(raw_page_jobs),
+                    kept_count=len(page_jobs),
+                    filtered_count=filtered_count,
+                    cumulative_count=len(jobs),
+                )
+                filter_text = "未进行地区过滤" if not city else f"过滤非目标地区 {filtered_count} 条"
+                emit_task_log(
+                    settings,
+                    f"第 {current_page} 页解析到 {len(raw_page_jobs)} 条，"
+                    f"{filter_text}，准备处理 {len(page_jobs)} 条。",
+                )
 
                 if not page_jobs:
-                    print(
+                    emit_task_log(
+                        settings,
                         f"第 {current_page} 页：解析 {len(raw_page_jobs)} 条，"
-                        f"但均不属于目标地区《{city}》，已跳过。"
+                        f"但均不属于目标地区《{region_label}》，已跳过。"
                     )
+                    if is_cancel_requested(settings):
+                        emit_cancel_log_once(settings, "收到中止请求，当前页已处理完成，停止继续翻页。")
+                        break
                     if current_page >= settings["max_pages_per_region"]:
                         break
 
-                    next_page = current_page + 1
-                    next_url = build_search_url(keyword=keyword, city_name=city, page=next_page)
                     if not extract_next_page_url(html):
-                        print("已到最后一页。")
+                        emit_task_log(settings, "已到最后一页。")
                         break
 
                     await human_sleep(*settings["delays"]["before_next_page"])
-                    try:
-                        await page.goto(next_url, wait_until="domcontentloaded", timeout=90000)
-                    except Exception as e:
-                        print(f"跳转下一页时遇到网络异常：{e}，结束当前搜索。")
-                        break
-                    await human_sleep(*settings["delays"]["after_next_page"])
-                    current_page = next_page
+                    current_page += 1
                     continue
 
-                detail_updated = await enrich_jobs_with_detail_summaries(
-                    context=context,
-                    jobs=page_jobs,
-                    settings=settings,
-                    summary_cache=detail_summary_cache,
-                    crawled_link_store=crawled_link_store,
-                )
-
                 new_count = 0
-                for item in page_jobs:
+                page_result_callback = settings.get("page_result_callback")
+
+                def handle_processed_item(item, detail_index=None):
+                    nonlocal new_count
                     if not clean_text(str(item.get("岗位类别/大类", ""))):
                         item["岗位类别/大类"] = keyword
+                    export_keyword = clean_text(str(settings.get("export_keyword", "")))
+                    if export_keyword and not clean_text(str(item.get("岗位类型一级", ""))):
+                        item["岗位类型一级"] = export_keyword
+                    detail_link = clean_text(str(item.get("岗位链接", "")))
                     key = (
-                        item["公司名称"],
-                        item["岗位名称"],
-                        item.get("城市", ""),
-                        item.get("岗位链接", ""),
+                        ("link", detail_link)
+                        if detail_link
+                        else (
+                            "fallback",
+                            item["公司名称"],
+                            item["岗位名称"],
+                            item.get("城市", ""),
+                        )
                     )
                     if key in seen:
-                        continue
+                        return
                     seen.add(key)
                     jobs.append(item)
                     new_count += 1
+                    if callable(page_result_callback):
+                        page_result_callback(
+                            keyword,
+                            [item],
+                            {
+                                "platform": "zhaopin",
+                                "region": region_label,
+                                "page": current_page,
+                                "total_pages": settings["max_pages_per_region"],
+                                "detail_index": detail_index,
+                                "export_keyword": export_keyword or keyword,
+                            },
+                        )
 
-                print(
+                if settings.get("skip_detail_fetch"):
+                    detail_updated = 0
+                    emit_task_log(settings, "已启用列表页导出模式：跳过详情页补全，直接写入当前页岗位。")
+                    for index, item in enumerate(page_jobs, start=1):
+                        handle_processed_item(item, index)
+                        if is_cancel_requested(settings):
+                            emit_cancel_log_once(settings, "收到中止请求，当前页已处理完成，停止继续翻页。")
+                            break
+                else:
+                    detail_updated = await enrich_jobs_with_detail_summaries(
+                        context=context,
+                        jobs=page_jobs,
+                        settings=settings,
+                        summary_cache=detail_summary_cache,
+                        crawled_link_store=crawled_link_store,
+                        item_callback=handle_processed_item,
+                    )
+
+                emit_task_log(
+                    settings,
                     f"第 {current_page} 页：解析 {len(raw_page_jobs)} 条，"
-                    f"过滤非目标地区 {filtered_count} 条，详情补全 {detail_updated} 条，"
+                    f"{filter_text}，详情补全 {detail_updated} 条，"
                     f"新增 {new_count} 条（累计 {len(jobs)} 条）"
                 )
+                update_task_progress(settings, cumulative_count=len(jobs), current_detail_url="")
+
+                if is_cancel_requested(settings):
+                    emit_cancel_log_once(settings, "收到中止请求，当前页已处理完成，停止继续翻页。")
+                    break
 
                 if current_page >= settings["max_pages_per_region"]:
                     break
 
-                # 优先使用 query 参数构造下一页 URL，减少对页面内加密路径的依赖。
-                next_page = current_page + 1
-                next_url = build_search_url(keyword=keyword, city_name=city, page=next_page)
-
                 # 当页面确认没有下一页时停止。
                 if not extract_next_page_url(html):
-                    print("已到最后一页。")
+                    emit_task_log(settings, "已到最后一页。")
                     break
 
                 if (
@@ -821,26 +1372,18 @@ async def crawl_zhaopin(
                     and current_page % settings["long_break_every_pages"] == 0
                     and random.random() < settings["long_break_probability"]
                 ):
-                    print("执行随机冷却暂停，降低高频行为特征。")
+                    emit_task_log(settings, "执行随机冷却暂停，降低高频行为特征。")
                     await human_sleep(*settings["delays"]["long_break"])
 
                 await human_sleep(*settings["delays"]["before_next_page"])
-                try:
-                    await page.goto(next_url, wait_until="domcontentloaded", timeout=90000)
-                except Exception as e:
-                    print(f"跳转下一页时遇到网络异常：{e}，正在重试...")
-                    await human_sleep(2.0, 4.0)
-                    try:
-                        await page.goto(next_url, wait_until="domcontentloaded", timeout=90000)
-                    except Exception as e2:
-                        print(f"重试跳页依然失败：{e2}，结束当前搜索。")
-                        break
-
-                await human_sleep(*settings["delays"]["after_next_page"])
-                current_page = next_page
+                current_page += 1
+                continue
 
         finally:
             await context.close()
-            await browser.close()
+            if proc is not None:
+                stop_orbita_browser(proc)
+            elif gl is not None:
+                stop_gologin_api(gl)
 
     return jobs

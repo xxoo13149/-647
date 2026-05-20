@@ -2,12 +2,13 @@ import asyncio
 from pathlib import Path
 
 from .config import apply_cli_overrides, load_env_config, parse_cli_args, print_config_summary
+from .category_presets import expand_zhaopin_keyword_groups
 from .constants import ENV_FILE_NAME, OUTPUT_COLUMNS
 from .crawled_links import build_crawled_link_store
 from .fiftyone import crawl_51job, login_51job_profile
 from .output import save_jobs_by_keyword
 from .utils import human_sleep
-from .zhaopin import crawl_zhaopin
+from .zhaopin import crawl_zhaopin, login_zhaopin_profile
 
 
 async def main() -> None:
@@ -26,12 +27,19 @@ async def main() -> None:
     if settings["platform"] == "51job" and settings["login_51job"]:
         await login_51job_profile(settings)
         return
+    if settings["platform"] == "zhaopin" and settings["login_zhaopin"]:
+        await login_zhaopin_profile(settings)
+        return
 
     print(f"提示：程序将自动打开浏览器抓取 {settings['platform']} 平台数据。")
     print_config_summary(settings, env_path)
     crawled_link_store = build_crawled_link_store(settings)
 
-    total_tasks = len(settings["keywords"]) * len(settings["regions"])
+    keyword_groups = expand_zhaopin_keyword_groups(settings["keywords"]) if settings["platform"] == "zhaopin" else [
+        {"label": keyword, "searches": [{"search_keyword": keyword, "primary_category": keyword, "secondary_category": ""}]}
+        for keyword in settings["keywords"]
+    ]
+    total_tasks = sum(len(group["searches"]) for group in keyword_groups) * len(settings["regions"])
     current_task = 0
     saved_file_count = 0
     raw_total = 0
@@ -39,29 +47,41 @@ async def main() -> None:
     updated_total = 0
     saved_files: list[str] = []
 
-    for keyword in settings["keywords"]:
+    for group in keyword_groups:
+        keyword = str(group["label"])
         keyword_jobs = []
-        for city in settings["regions"]:
-            current_task += 1
-            print(f"\n任务进度：{current_task}/{total_tasks}（关键词={keyword}，地区={city}）")
-            if settings["platform"] == "51job":
-                region_jobs = await crawl_51job(
-                    keyword=keyword,
-                    city=city,
-                    settings=settings,
-                    crawled_link_store=crawled_link_store,
+        for search in group["searches"]:
+            search_keyword = str(search["search_keyword"])
+            primary_category = str(search.get("primary_category") or keyword)
+            secondary_category = str(search.get("secondary_category") or "")
+            for city in settings["regions"]:
+                current_task += 1
+                print(
+                    f"\n任务进度：{current_task}/{total_tasks}（关键词={search_keyword}，地区={city}）"
                 )
-            else:
-                region_jobs = await crawl_zhaopin(
-                    keyword=keyword,
-                    city=city,
-                    settings=settings,
-                    crawled_link_store=crawled_link_store,
-                )
-            keyword_jobs.extend(region_jobs)
+                if settings["platform"] == "51job":
+                    region_jobs = await crawl_51job(
+                        keyword=search_keyword,
+                        city=city,
+                        settings=settings,
+                        crawled_link_store=crawled_link_store,
+                    )
+                else:
+                    region_jobs = await crawl_zhaopin(
+                        keyword=search_keyword,
+                        city=city,
+                        settings=settings,
+                        crawled_link_store=crawled_link_store,
+                    )
+                    for item in region_jobs:
+                        if primary_category:
+                            item["岗位类型一级"] = primary_category
+                        if secondary_category:
+                            item["岗位类型二级"] = secondary_category
+                keyword_jobs.extend(region_jobs)
 
-            if current_task < total_tasks:
-                await human_sleep(*settings["delays"]["between_tasks"])
+                if current_task < total_tasks:
+                    await human_sleep(*settings["delays"]["between_tasks"])
 
         if not keyword_jobs:
             print(f"\n关键词《{keyword}》未抓取到数据，已跳过写入。")

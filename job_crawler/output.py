@@ -18,6 +18,8 @@ from .utils import (
     split_job_summary,
 )
 
+PAGE_SIZE = 20
+
 
 def normalize_job_record(item: dict[str, Any]) -> dict[str, str]:
     """标准化岗位记录字段。"""
@@ -42,6 +44,14 @@ def normalize_job_record(item: dict[str, Any]) -> dict[str, str]:
 
     if record["招聘平台"] == EMPTY_CELL_VALUE:
         record["招聘平台"] = "智联招聘"
+    if record["岗位类型一级"] == EMPTY_CELL_VALUE:
+        record["岗位类型一级"] = fill_empty(item.get("岗位类型一级", item.get("岗位类别/大类", "")))
+    if record["岗位类型二级"] == EMPTY_CELL_VALUE:
+        record["岗位类型二级"] = fill_empty(item.get("岗位类型二级", ""))
+    if record["岗位类型企业/公务员/事业单位/军队文职"] == EMPTY_CELL_VALUE:
+        record["岗位类型企业/公务员/事业单位/军队文职"] = fill_empty(
+            item.get("岗位类型企业/公务员/事业单位/军队文职", "企业")
+        )
     if record["公司名称"] == EMPTY_CELL_VALUE:
         record["公司名称"] = fill_empty(item.get("招聘单位名称", ""))
     if record["岗位名称"] == EMPTY_CELL_VALUE:
@@ -50,6 +60,10 @@ def normalize_job_record(item: dict[str, Any]) -> dict[str, str]:
         record["投递起始时间"] = fill_empty(normalize_publish_time_text(item.get("最新发布时间", "")))
     else:
         record["投递起始时间"] = fill_empty(normalize_publish_time_text(record["投递起始时间"]))
+    if record["发布时间"] == EMPTY_CELL_VALUE:
+        record["发布时间"] = record["投递起始时间"]
+    if record["证书要求"] == EMPTY_CELL_VALUE:
+        record["证书要求"] = fill_empty(item.get("证书要求", ""))
 
     fallback_map = {
         "薪资范围": legacy_salary,
@@ -78,6 +92,10 @@ def normalize_job_record(item: dict[str, Any]) -> dict[str, str]:
         record["公司名称"] = "未知单位"
     if record["岗位名称"] == EMPTY_CELL_VALUE:
         record["岗位名称"] = "未知岗位"
+    if record["岗位类型一级"] == EMPTY_CELL_VALUE:
+        record["岗位类型一级"] = "技术"
+    if record["岗位类型企业/公务员/事业单位/军队文职"] == EMPTY_CELL_VALUE:
+        record["岗位类型企业/公务员/事业单位/军队文职"] = "企业"
 
     return record
 
@@ -88,20 +106,22 @@ def load_existing_job_records(file_path: Path) -> list[dict[str, str]]:
         return []
 
     try:
-        df = pd.read_excel(file_path, dtype=str, engine="openpyxl").fillna("")
+        sheets = pd.read_excel(file_path, dtype=str, engine="openpyxl", sheet_name=None)
     except Exception as exc:
         print(f"警告：读取现有文件失败，将以新数据重建：{file_path}，原因：{exc}")
         return []
 
-    if df.empty:
-        return []
-
-    if "序号" in df.columns:
-        df = df.drop(columns=["序号"])
-
     records = []
-    for _, row in df.iterrows():
-        records.append(normalize_job_record(row.to_dict()))
+    for df in sheets.values():
+        if df is None:
+            continue
+        df = df.fillna("")
+        if df.empty:
+            continue
+        if "序号" in df.columns:
+            df = df.drop(columns=["序号"])
+        for _, row in df.iterrows():
+            records.append(normalize_job_record(row.to_dict()))
     return records
 
 
@@ -177,16 +197,26 @@ def build_record_key(record: dict[str, str]) -> tuple[str, ...]:
 
 
 def write_job_records_to_excel(file_path: Path, records: list[dict[str, str]]) -> None:
-    """将岗位记录写入 Excel，序号每次按当前文件重排。"""
-    df = pd.DataFrame(records)
+    """将岗位记录写入 Excel，并按 20 条一页拆分为多个工作表。"""
+    if not records:
+        return
 
+    df = pd.DataFrame(records)
     for column in OUTPUT_COLUMNS:
         if column not in df.columns:
             df[column] = ""
+    df = df[OUTPUT_COLUMNS].fillna("")
 
-    df = df[OUTPUT_COLUMNS]
-    df.insert(0, "序号", range(1, len(df) + 1))
-    df.to_excel(file_path, index=False, engine="openpyxl")
+    pages = max(1, (len(df) + PAGE_SIZE - 1) // PAGE_SIZE)
+    with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+        for page_index in range(pages):
+            start = page_index * PAGE_SIZE
+            end = start + PAGE_SIZE
+            page_df = df.iloc[start:end].copy()
+            page_df.insert(0, "序号", range(start + 1, min(end, len(df)) + 1))
+            sheet_name = f"第{page_index + 1}页"
+            page_df.to_excel(writer, index=False, sheet_name=sheet_name)
+
     format_output_workbook(file_path)
 
 
@@ -200,22 +230,15 @@ def format_output_workbook(file_path: Path) -> None:
         return
 
     wb = load_workbook(file_path)
-    ws = wb.active
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
     header_fill = PatternFill("solid", fgColor="D9EAF7")
     header_font = Font(bold=True)
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
     width_by_header = {
         "序号": 8,
         "招聘平台": 12,
-        "岗位类别/大类": 16,
+        "岗位类型一级": 14,
+        "岗位类型二级": 14,
         "岗位名称": 28,
+        "岗位类型企业/公务员/事业单位/军队文职": 18,
         "公司名称": 26,
         "公司规模": 14,
         "所在省份": 14,
@@ -228,18 +251,26 @@ def format_output_workbook(file_path: Path) -> None:
         "工作内容": 48,
         "任职要求": 48,
         "岗位链接": 44,
+        "发布时间": 18,
         "投递起始时间": 18,
         "投递截止时间": 18,
+        "证书要求": 16,
         "备注": 30,
     }
 
-    for index, cell in enumerate(ws[1], start=1):
-        letter = get_column_letter(index)
-        ws.column_dimensions[letter].width = width_by_header.get(str(cell.value), 16)
-
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for index, cell in enumerate(ws[1], start=1):
+            letter = get_column_letter(index)
+            ws.column_dimensions[letter].width = width_by_header.get(str(cell.value), 16)
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
 
     wb.save(file_path)
 

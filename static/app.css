@@ -110,16 +110,21 @@ a:hover {
 }
 
 .nav-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 32px;
   border-radius: 6px;
   padding: 0 12px;
   color: #475467;
   background: transparent;
   font-weight: 700;
+  text-decoration: none;
 }
 
 .nav-link:hover {
   background: var(--surface-muted);
+  text-decoration: none;
 }
 
 .nav-link.active {
@@ -130,6 +135,13 @@ a:hover {
 .layout {
   display: grid;
   grid-template-columns: minmax(320px, 0.86fr) minmax(420px, 1.14fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.home-layout {
+  display: grid;
+  grid-template-columns: minmax(420px, 0.95fr) minmax(360px, 1.05fr);
   gap: 18px;
   align-items: start;
 }
@@ -152,11 +164,14 @@ a:hover {
 .form-panel,
 .task-panel,
 .data-panel,
-.settings-panel {
+.settings-panel,
+.detail-header-panel,
+.detail-main-panel {
   padding: 20px;
 }
 
-.data-panel {
+.data-panel,
+.detail-main-panel {
   margin-top: 18px;
 }
 
@@ -197,7 +212,8 @@ a:hover {
 }
 
 .grid-2,
-.grid-3 {
+.grid-3,
+.grid-4 {
   display: grid;
   gap: 12px;
 }
@@ -208,6 +224,10 @@ a:hover {
 
 .grid-3 {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.grid-4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 label {
@@ -303,14 +323,27 @@ textarea::placeholder {
 
 .compact {
   min-height: 30px;
+  min-width: 96px;
   padding: 0 11px;
   font-size: 13px;
+  white-space: nowrap;
 }
 
 .secondary:hover,
 .icon-button:hover {
   background: #fff;
   box-shadow: 0 8px 22px rgba(16, 24, 40, 0.08);
+}
+
+.danger-action {
+  color: var(--danger);
+  border-color: #f0b8b8;
+  background: #fff8f7;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
 }
 
 .alert,
@@ -378,6 +411,11 @@ textarea::placeholder {
   max-height: 560px;
 }
 
+.task-list-wide {
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  max-height: none;
+}
+
 .task-card {
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -434,6 +472,16 @@ textarea::placeholder {
   background: #eaf1ff;
 }
 
+.status.stopping {
+  color: #b45309;
+  background: #fff4d6;
+}
+
+.status.stopped {
+  color: #475467;
+  background: #eef2f6;
+}
+
 .status.completed {
   color: var(--success);
   background: var(--success-bg);
@@ -442,6 +490,28 @@ textarea::placeholder {
 .status.failed {
   color: var(--danger);
   background: var(--danger-bg);
+}
+
+.platform-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 12px;
+  font-weight: 760;
+  white-space: nowrap;
+}
+
+.platform-zhaopin {
+  color: #075985;
+  background: #e0f2fe;
+}
+
+.platform-51job {
+  color: #7c2d12;
+  background: #ffedd5;
 }
 
 .task-metrics {
@@ -482,6 +552,10 @@ textarea::placeholder {
   overflow: auto;
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
+}
+
+.detail-log {
+  max-height: 430px;
 }
 
 .log-title {
@@ -528,6 +602,10 @@ textarea::placeholder {
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
   margin-top: 16px;
+}
+
+.compact-summary {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .summary-grid div,
@@ -578,8 +656,84 @@ textarea::placeholder {
   font-weight: 700;
 }
 
+.auth-card {
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  padding: 12px;
+}
+
+.auth-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.auth-head strong,
+.auth-head span {
+  display: block;
+}
+
+.auth-head span {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auth-log {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #fff;
+  padding: 9px 10px;
+  color: #475467;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.auth-error {
+  margin-top: 10px;
+  border-radius: 7px;
+  background: var(--danger-bg);
+  padding: 9px 10px;
+}
+
 .detail-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.detail-strip {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.detail-strip div {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-muted);
+  padding: 8px 10px;
+}
+
+.detail-strip span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.detail-strip strong {
+  display: block;
+  min-width: 0;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .file-chip {
@@ -621,12 +775,60 @@ textarea::placeholder {
   max-height: 540px;
 }
 
+.history-table-wrap {
+  max-height: none;
+  overflow-x: auto;
+  overflow-y: visible;
+}
+
+.pagination-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.pagination-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 table {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
   min-width: 980px;
   font-size: 13px;
+}
+
+.history-table {
+  min-width: 1040px;
+}
+
+.history-row {
+  cursor: pointer;
+}
+
+.history-row:hover td {
+  background: #f8fbff;
+}
+
+.history-row td:first-child strong {
+  display: block;
+  color: var(--text);
+}
+
+.history-row td:first-child span {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.history-table .history-middle {
+  vertical-align: middle;
 }
 
 th,
@@ -669,6 +871,7 @@ tbody tr:last-child td {
 
   .topbar,
   .layout,
+  .home-layout,
   .history-layout {
     display: grid;
     grid-template-columns: 1fr;
@@ -692,7 +895,12 @@ tbody tr:last-child td {
   }
 
   .summary-grid,
-  .detail-grid {
+  .detail-grid,
+  .detail-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .grid-4 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -710,9 +918,11 @@ tbody tr:last-child td {
 
   .grid-2,
   .grid-3,
+  .grid-4,
   .task-metrics,
   .summary-grid,
-  .detail-grid {
+  .detail-grid,
+  .detail-strip {
     grid-template-columns: 1fr;
   }
 
@@ -724,6 +934,19 @@ tbody tr:last-child td {
 
   .panel-actions {
     justify-content: flex-start;
+  }
+
+  .pagination-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pagination-actions {
+    width: 100%;
+  }
+
+  .pagination-actions .secondary {
+    flex: 1;
   }
 
   .settings-list div {
