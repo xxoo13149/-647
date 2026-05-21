@@ -15,6 +15,7 @@ from .gologin_backend import (
     using_gologin_api,
     get_gologin_executable_path,
 )
+from .output import build_job_record_key
 from .stealth_js import STEALTH_INIT_SCRIPT
 from .adspower_backend import launch_adspower_browser
 from .utils import *  # noqa: F403
@@ -575,12 +576,25 @@ async def crawl_51job(
                     if is_job_in_target_city(str(item.get("__工作城市", "")), city)
                 ]
                 filtered_count = len(raw_page_jobs) - len(page_jobs)
+                existing_filtered_count = 0
+                existing_output_record_keys = settings.get("_current_output_record_keys")
+                if settings.get("filter_existing_output_early") and isinstance(existing_output_record_keys, set):
+                    filtered_page_jobs = []
+                    for item in page_jobs:
+                        if build_job_record_key(item) in existing_output_record_keys:
+                            existing_filtered_count += 1
+                            continue
+                        filtered_page_jobs.append(item)
+                    page_jobs = filtered_page_jobs
                 filter_text = "未进行地区过滤" if not city else f"过滤非目标地区 {filtered_count} 条"
+                if existing_filtered_count:
+                    filter_text += f"，过滤 Excel 已有岗位 {existing_filtered_count} 条"
                 update_task_progress(
                     settings,
                     parsed_count=len(raw_page_jobs),
                     kept_count=len(page_jobs),
                     filtered_count=filtered_count,
+                    existing_filtered_count=existing_filtered_count,
                     cumulative_count=len(jobs),
                 )
                 emit_task_log(
@@ -589,6 +603,30 @@ async def crawl_51job(
                     f"{filter_text}，准备处理 {len(page_jobs)} 条。",
                 )
 
+                if not page_jobs:
+                    emit_task_log(
+                        settings,
+                        f"51job 第 {current_page} 页：解析 {len(raw_page_jobs)} 条，"
+                        f"{filter_text}，但剩余岗位均已存在于当前 Excel 或已被地区过滤，已跳过。",
+                    )
+                    if is_cancel_requested(settings):
+                        emit_cancel_log_once(settings, "收到中止请求，当前页已处理完成，停止继续翻页。")
+                        break
+                    if current_page >= settings["max_pages_per_region"]:
+                        break
+                    next_buttons = page.get_by_text("下一页", exact=True)
+                    if await next_buttons.count() == 0:
+                        emit_task_log(settings, "51job 已到最后一页。")
+                        break
+                    try:
+                        await next_buttons.first.click(timeout=5000)
+                    except Exception:
+                        emit_task_log(settings, "51job 点击下一页失败，结束当前搜索。")
+                        break
+                    await human_sleep(*settings["delays"]["after_next_page"])
+                    current_page += 1
+                    continue
+
                 new_count = 0
                 page_result_callback = settings.get("page_result_callback")
 
@@ -596,20 +634,12 @@ async def crawl_51job(
                     nonlocal new_count
                     if not clean_text(str(item.get("岗位类别/大类", ""))):
                         item["岗位类型一级"] = keyword
-                    detail_link = clean_text(str(item.get("岗位链接", "")))
-                    key = (
-                        ("link", detail_link)
-                        if detail_link
-                        else (
-                            "fallback",
-                            item["公司名称"],
-                            item["岗位名称"],
-                            item.get("城市", ""),
-                        )
-                    )
+                    key = build_job_record_key(item)
                     if key in seen:
                         return
                     seen.add(key)
+                    if isinstance(existing_output_record_keys, set):
+                        existing_output_record_keys.add(key)
                     jobs.append(item)
                     new_count += 1
                     if callable(page_result_callback):

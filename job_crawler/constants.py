@@ -61,6 +61,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "scrapling_hide_canvas": True,
     "skip_detail_fetch": True,
     "refetch_crawled_details": False,
+    "filter_existing_output_early": False,
     "auto_restart_on_verify": False,
     "max_restart_attempts": 3,
     "yescaptcha_proxy": "",
