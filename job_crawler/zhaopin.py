@@ -17,7 +17,7 @@ from .browser_backend import (
     using_orbita_cdp,
     using_scrapling,
 )
-from .constants import DEFAULT_CONFIG, ZHAOPIN_SEARCH_URL
+from .constants import DEFAULT_CONFIG, EMPTY_CELL_VALUE, ZHAOPIN_SEARCH_URL
 from .crawled_links import CrawledLinkStore
 from .gologin_backend import (
     launch_gologin_browser,
@@ -66,6 +66,15 @@ ZHAOPIN_DETAIL_WAIT_SELECTOR = (
 
 class ZhaopinRateLimitError(RuntimeError):
     """Raised when Zhaopin returns a frequency-control page that cannot be manually cleared."""
+
+
+def has_detail_summary(item: dict[str, Any]) -> bool:
+    """Return whether a list item already carries usable detail text."""
+    for key in ("工作内容", "任职要求", "__岗位摘要"):
+        value = clean_text(str(item.get(key, "")))
+        if value and value != EMPTY_CELL_VALUE:
+            return True
+    return False
 
 
 def build_detail_address_from_state_item(item: dict[str, Any]) -> str:
@@ -714,7 +723,8 @@ async def login_zhaopin_profile(settings: dict[str, Any]) -> None:
     """Open a persistent Zhaopin browser profile for manual verification/login."""
     if async_playwright is None:
         raise RuntimeError(
-            "缺少 Playwright 依赖，请先运行：pip install -r requirements.txt && playwright install chromium"
+            "缺少 Playwright Python 依赖，请先运行：pip install -r requirements.txt。"
+            "orbita_cdp 主流程不需要安装 Playwright 自带 Chromium。"
         )
 
     user_data_dir = Path(settings["zhaopin_user_data_dir"])
@@ -940,7 +950,12 @@ async def enrich_jobs_with_detail_summaries(
                     emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
                     break
                 continue
-            if crawled_link_store is not None and crawled_link_store.contains(detail_url):
+            detail_already_recorded = crawled_link_store is not None and crawled_link_store.contains(detail_url)
+            detail_text_recorded = crawled_link_store is not None and crawled_link_store.has_detail_text(detail_url)
+            force_detail_refetch = bool(settings.get("refetch_crawled_details"))
+            if detail_already_recorded and not force_detail_refetch and (
+                detail_text_recorded or has_detail_summary(item)
+            ):
                 emit_task_log(settings, f"详情链接已抓取过，跳过 ({index}/{total_jobs})：{detail_url}")
                 if callable(item_callback):
                     item_callback(item, index)
@@ -948,6 +963,10 @@ async def enrich_jobs_with_detail_summaries(
                     emit_cancel_log_once(settings, "收到中止请求，当前详情已处理完成，停止继续分析剩余详情。")
                     break
                 continue
+            if detail_already_recorded and force_detail_refetch:
+                emit_task_log(settings, f"详情链接有历史记录，已按配置重新补全 ({index}/{total_jobs})：{detail_url}")
+            elif detail_already_recorded:
+                emit_task_log(settings, f"详情链接有历史记录但当前缺少详情字段，重新补全 ({index}/{total_jobs})：{detail_url}")
 
             fetched_from_network = False
             if detail_url in summary_cache:
@@ -960,7 +979,7 @@ async def enrich_jobs_with_detail_summaries(
                 fetched_from_network = True
                 update_task_progress(settings, current_detail_url=detail_url, detail_index=index, detail_total=total_jobs)
                 emit_task_log(settings, f"正在分析详情链接 ({index}/{total_jobs})：{detail_url}")
-                if crawled_link_store is not None:
+                if crawled_link_store is not None and not detail_already_recorded:
                     if not crawled_link_store.add(detail_url):
                         emit_task_log(settings, f"详情链接被其他任务记录，跳过 ({index}/{total_jobs})：{detail_url}")
                         if callable(item_callback):
@@ -978,6 +997,8 @@ async def enrich_jobs_with_detail_summaries(
                 summary_cache[detail_url] = full_summary
 
             if full_summary:
+                if crawled_link_store is not None:
+                    crawled_link_store.mark_detail_text(detail_url)
                 work_content, requirement = split_job_summary(full_summary)
                 changed = False
                 if work_content and work_content != item.get("工作内容", ""):
@@ -1098,7 +1119,8 @@ async def crawl_zhaopin(
     """爬取智联招聘岗位数据并返回列表。"""
     if async_playwright is None:
         raise RuntimeError(
-            "缺少 Playwright 依赖，请先运行：pip install -r requirements.txt && playwright install chromium"
+            "缺少 Playwright Python 依赖，请先运行：pip install -r requirements.txt。"
+            "orbita_cdp 主流程不需要安装 Playwright 自带 Chromium。"
         )
 
     jobs = []
