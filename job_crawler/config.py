@@ -119,6 +119,11 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="即使详情链接已有历史记录，也重新打开详情页补全。",
     )
+    parser.add_argument(
+        "--filter-existing-output-early",
+        action="store_true",
+        help="每页解析后先按当前 Excel 已有岗位过滤，再决定是否进入详情页补全。",
+    )
     return parser.parse_args(argv)
 
 
@@ -164,6 +169,8 @@ def apply_cli_overrides(
         merged["skip_detail_fetch"] = True
     if args.refetch_crawled_details:
         merged["refetch_crawled_details"] = True
+    if args.filter_existing_output_early:
+        merged["filter_existing_output_early"] = True
 
     if args.headless:
         merged["headless"] = True
@@ -475,6 +482,10 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
             os.getenv("REFETCH_CRAWLED_DETAILS", str(DEFAULT_CONFIG["refetch_crawled_details"])),
             bool(DEFAULT_CONFIG["refetch_crawled_details"]),
         ),
+        "filter_existing_output_early": parse_bool(
+            os.getenv("FILTER_EXISTING_OUTPUT_EARLY", str(DEFAULT_CONFIG["filter_existing_output_early"])),
+            bool(DEFAULT_CONFIG["filter_existing_output_early"]),
+        ),
         "yescaptcha_api_key": clean_text(os.getenv("YESCAPTCHA_API_KEY", "")),
         "yescaptcha_proxy": clean_text(os.getenv("YESCAPTCHA_PROXY", "")),
     }
@@ -532,6 +543,7 @@ def print_config_summary(settings: dict[str, Any], env_path: Path) -> None:
         print("Orbita CDP：独立启动 + Playwright 远程连接（无自动化标识条）")
     print(f"稳妥模式（跳过详情页）：{settings['skip_detail_fetch']}")
     print(f"历史详情链接强制重抓：{settings['refetch_crawled_details']}")
+    print(f"提前过滤 Excel 已有岗位：{settings['filter_existing_output_early']}")
     print(f"输出目录：{settings['output_dir']}")
     print(f"已爬取链接目录：{settings['crawled_links_dir']}")
     print(f"批量任务数：{len(settings['keywords']) * region_count}")

@@ -7,7 +7,12 @@ from .category_presets import expand_zhaopin_keyword_groups
 from .constants import ENV_FILE_NAME, OUTPUT_COLUMNS
 from .crawled_links import build_crawled_link_store
 from .fiftyone import crawl_51job, login_51job_profile
-from .output import append_jobs_checkpoint, save_jobs_by_keyword
+from .output import (
+    append_jobs_checkpoint,
+    build_output_file_path,
+    load_existing_job_record_keys,
+    save_jobs_by_keyword,
+)
 from .utils import human_sleep
 from .zhaopin import crawl_zhaopin, login_zhaopin_profile
 
@@ -51,6 +56,7 @@ async def main() -> None:
             checkpoint_files.add(str(checkpoint_path))
 
     settings["page_result_callback"] = record_cli_checkpoint
+    settings["_existing_output_record_keys_map"] = {}
 
     keyword_groups = expand_zhaopin_keyword_groups(settings["keywords"]) if settings["platform"] == "zhaopin" else [
         {"label": keyword, "searches": [{"search_keyword": keyword, "primary_category": keyword, "secondary_category": ""}]}
@@ -67,6 +73,13 @@ async def main() -> None:
 
     for group in keyword_groups:
         keyword = str(group["label"])
+        settings["export_keyword"] = keyword
+        if settings.get("filter_existing_output_early"):
+            key_cache = settings["_existing_output_record_keys_map"]
+            key_cache[keyword] = load_existing_job_record_keys(
+                build_output_file_path(settings["output_dir"], keyword)
+            )
+            settings["_current_output_record_keys"] = key_cache[keyword]
         keyword_jobs = []
         for search in group["searches"]:
             search_keyword = str(search["search_keyword"])

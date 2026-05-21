@@ -25,6 +25,7 @@ from .gologin_backend import (
     using_gologin_api,
     get_gologin_executable_path,
 )
+from .output import build_job_record_key
 from .stealth_js import STEALTH_INIT_SCRIPT
 from .adspower_backend import launch_adspower_browser
 from .orbita_cdp_backend import launch_orbita_browser, stop_orbita_browser, connect_playwright_to_orbita
@@ -1277,14 +1278,27 @@ async def crawl_zhaopin(
                     if is_job_in_target_city(str(item.get("__工作城市", "")), city)
                 ]
                 filtered_count = len(raw_page_jobs) - len(page_jobs)
+                existing_filtered_count = 0
+                existing_output_record_keys = settings.get("_current_output_record_keys")
+                if settings.get("filter_existing_output_early") and isinstance(existing_output_record_keys, set):
+                    filtered_page_jobs = []
+                    for item in page_jobs:
+                        if build_job_record_key(item) in existing_output_record_keys:
+                            existing_filtered_count += 1
+                            continue
+                        filtered_page_jobs.append(item)
+                    page_jobs = filtered_page_jobs
                 update_task_progress(
                     settings,
                     parsed_count=len(raw_page_jobs),
                     kept_count=len(page_jobs),
                     filtered_count=filtered_count,
+                    existing_filtered_count=existing_filtered_count,
                     cumulative_count=len(jobs),
                 )
                 filter_text = "未进行地区过滤" if not city else f"过滤非目标地区 {filtered_count} 条"
+                if existing_filtered_count:
+                    filter_text += f"，过滤 Excel 已有岗位 {existing_filtered_count} 条"
                 emit_task_log(
                     settings,
                     f"第 {current_page} 页解析到 {len(raw_page_jobs)} 条，"
@@ -1292,10 +1306,19 @@ async def crawl_zhaopin(
                 )
 
                 if not page_jobs:
+                    if existing_filtered_count:
+                        skip_reason = (
+                            f"第 {current_page} 页：解析 {len(raw_page_jobs)} 条，"
+                            f"{filter_text}，但剩余岗位均已存在于当前 Excel，已跳过。"
+                        )
+                    else:
+                        skip_reason = (
+                            f"第 {current_page} 页：解析 {len(raw_page_jobs)} 条，"
+                            f"但均不属于目标地区《{region_label}》，已跳过。"
+                        )
                     emit_task_log(
                         settings,
-                        f"第 {current_page} 页：解析 {len(raw_page_jobs)} 条，"
-                        f"但均不属于目标地区《{region_label}》，已跳过。"
+                        skip_reason,
                     )
                     if is_cancel_requested(settings):
                         emit_cancel_log_once(settings, "收到中止请求，当前页已处理完成，停止继续翻页。")
@@ -1321,20 +1344,12 @@ async def crawl_zhaopin(
                     export_keyword = clean_text(str(settings.get("export_keyword", "")))
                     if export_keyword and not clean_text(str(item.get("岗位类型一级", ""))):
                         item["岗位类型一级"] = export_keyword
-                    detail_link = clean_text(str(item.get("岗位链接", "")))
-                    key = (
-                        ("link", detail_link)
-                        if detail_link
-                        else (
-                            "fallback",
-                            item["公司名称"],
-                            item["岗位名称"],
-                            item.get("城市", ""),
-                        )
-                    )
+                    key = build_job_record_key(item)
                     if key in seen:
                         return
                     seen.add(key)
+                    if isinstance(existing_output_record_keys, set):
+                        existing_output_record_keys.add(key)
                     jobs.append(item)
                     new_count += 1
                     if callable(page_result_callback):

@@ -200,6 +200,22 @@ def build_record_key(record: dict[str, str]) -> tuple[str, ...]:
     )
 
 
+def build_output_file_path(output_dir: Path, keyword: str) -> Path:
+    """Return the target workbook path for a keyword."""
+    base_name = sanitize_filename(keyword, fallback="未知关键词")
+    return Path(output_dir) / f"{base_name}.xlsx"
+
+
+def build_job_record_key(item: dict[str, Any]) -> tuple[str, ...]:
+    """Build a stable dedupe key from a raw crawler item."""
+    return build_record_key(normalize_job_record(item))
+
+
+def load_existing_job_record_keys(file_path: Path) -> set[tuple[str, ...]]:
+    """Load a workbook and build a key set for fast existence checks."""
+    return {build_record_key(record) for record in load_existing_job_records(file_path)}
+
+
 def build_fallback_output_path(file_path: Path) -> Path:
     """Build a unique fallback path when the target workbook is locked."""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -370,9 +386,7 @@ def save_jobs_by_keyword(jobs: list[dict], output_dir: Path, keyword: str) -> di
             "saved_files": [],
         }
 
-    base_name = sanitize_filename(keyword, fallback="未知关键词")
-    file_name = f"{base_name}.xlsx"
-    file_path = output_dir / file_name
+    file_path = build_output_file_path(output_dir, keyword)
 
     normalized_jobs = [normalize_job_record(item) for item in jobs]
     existing_records = load_existing_job_records(file_path)
