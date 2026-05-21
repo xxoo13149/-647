@@ -9,6 +9,7 @@ from .utils import clean_text, normalize_absolute_url
 
 
 LINK_COLUMN = "岗位链接"
+DETAIL_COLUMNS = ("工作内容", "任职要求")
 GLOBAL_LINKS_FILE_NAME = "all_links.txt"
 _links_file_lock = threading.RLock()
 
@@ -21,6 +22,17 @@ def normalize_crawled_link(url: str) -> str:
     return normalize_absolute_url(text)
 
 
+def row_has_detail_text(row) -> bool:
+    """Only treat an output row as detail-fetched when it has real detail text."""
+    for column in DETAIL_COLUMNS:
+        if column not in row:
+            continue
+        text = clean_text(str(row.get(column, "")))
+        if text and text != EMPTY_CELL_VALUE:
+            return True
+    return False
+
+
 class CrawledLinkStore:
     """Persistent text-file store used to skip already fetched detail pages."""
 
@@ -29,6 +41,7 @@ class CrawledLinkStore:
         self.platform = clean_text(platform).lower() or "default"
         self.file_path = self.links_dir / GLOBAL_LINKS_FILE_NAME
         self._links: set[str] = set()
+        self._detail_links: set[str] = set()
         self._dirty = False
 
     def load(self) -> None:
@@ -77,10 +90,14 @@ class CrawledLinkStore:
                 if df is None or LINK_COLUMN not in df.columns:
                     continue
                 df = df.fillna("")
-                for value in df[LINK_COLUMN].tolist():
+                for _, row in df.iterrows():
+                    if not row_has_detail_text(row):
+                        continue
+                    value = row[LINK_COLUMN]
                     normalized = normalize_crawled_link(str(value))
                     if normalized:
                         self._links.add(normalized)
+                        self._detail_links.add(normalized)
 
         if len(self._links) != before:
             self._dirty = True
@@ -94,6 +111,17 @@ class CrawledLinkStore:
             if self.file_path.exists():
                 self._read_links_from_file(self.file_path)
             return normalized in self._links
+
+    def has_detail_text(self, url: str) -> bool:
+        normalized = normalize_crawled_link(url)
+        if not normalized:
+            return False
+        return normalized in self._detail_links
+
+    def mark_detail_text(self, url: str) -> None:
+        normalized = normalize_crawled_link(url)
+        if normalized:
+            self._detail_links.add(normalized)
 
     def add(self, url: str) -> bool:
         normalized = normalize_crawled_link(url)

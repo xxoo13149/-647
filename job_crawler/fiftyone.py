@@ -258,7 +258,8 @@ async def login_51job_profile(settings: dict[str, Any]) -> None:
     """打开持久化浏览器 Profile，让用户真实登录 51job。"""
     if async_playwright is None:
         raise RuntimeError(
-            "缺少 Playwright 依赖，请先运行：pip install -r requirements.txt && playwright install chromium"
+            "缺少 Playwright Python 依赖，请先运行：pip install -r requirements.txt。"
+            "orbita_cdp 主流程不需要安装 Playwright 自带 Chromium。"
         )
 
     user_data_dir = Path(settings["user_data_dir"])
@@ -454,7 +455,8 @@ async def crawl_51job(
     """爬取 51job 搜索列表数据并返回岗位记录。"""
     if async_playwright is None:
         raise RuntimeError(
-            "缺少 Playwright 依赖，请先运行：pip install -r requirements.txt && playwright install chromium"
+            "缺少 Playwright Python 依赖，请先运行：pip install -r requirements.txt。"
+            "orbita_cdp 主流程不需要安装 Playwright 自带 Chromium。"
         )
 
     jobs: list[dict[str, Any]] = []

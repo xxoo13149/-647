@@ -1,174 +1,329 @@
-# 智联招聘数据爬虫 (Zhaopin Crawler)
+# 智联招聘岗位采集工具
 
-这是一个用于自动化抓取招聘平台职位数据的本地工具。当前支持**智联招聘** (zhaopin.com) 和 **51job**，可以根据自定义关键词和城市/地区进行定向抓取，也可以在 Web 控制台中创建任务、查看进度、预览结果并下载 Excel。
+这个项目现在的主流程是：`python main.py` 读取 `.env`，启动本机 GoLogin 下载的 Orbita 浏览器，通过 CDP 接管浏览器页面，人工处理登录和验证码，然后抓取智联招聘列表页与详情页，最后增量写入 Excel。
 
-## 技术实现细节
+重点先说清楚：当前跑通的主流程不是 Playwright 自带 Chromium 无头浏览器。代码里仍然需要 `playwright` 这个 Python 包来连接 CDP，但浏览器本体走的是 GoLogin/Orbita，也就是 `.env` 里的：
 
-本项目主要使用 Python 基于 `playwright` 异步接口进行开发，结合了多种技术来提高数据抓取的稳定性和准确性：
+```env
+BROWSER_BACKEND=orbita_cdp
+HEADLESS=false
+MANUAL_AUTH=true
+```
 
-- **自动化驱动底层**：使用 `playwright.async_api` 异步驱动无头浏览器 (Chromium) 模拟真实用户行为，支持对动态渲染页面的完美拉取。
-- **混合解析策略**：
-  - **状态拦截提取**：为了避免脆弱的 DOM 结构变动，程序优先通过正则提取页面源码中硬编码的 React `__INITIAL_STATE__` JSON 状态树，从中精准反序列化出结构化的职位数据。
-  - **DOM 兜底解析**：当状态树未能提供足够包含度的信息（如岗位详情页摘要部分）时，回退到使用 `BeautifulSoup` (bs4) 进行网页 DOM 的解析提取。
-- **反爬/防封策略优化**：
-  - **仿人类行为延时**：实现了动态随机的等待机制（如翻页延时、打字延时、超时重试冷却、以及长时仿真休息 `long_break` 等），避免触发机器行为风控规则。
-  - **设备环境伪装**：支持配置自定义 `USER_AGENT` 以及屏幕级 `VIEWPORT` 宽高，模拟不同的真实设备环境。
-- **数据结构化输出**：使用 `pandas` 数据框架统一清洗、归一化薪资、城市信息和发布时间，并最终规范化导出。
+不要把 `HEADLESS` 改成 `true`。智联招聘详情页抓取过程中经常会弹验证码，第一次进入详情页时尤其容易出现，后面也可能隔一阵弹一次。浏览器必须显示出来，看到验证码就手动点掉，程序会继续往后跑。
 
-## 核心功能
+## 当前主流程
 
-- **多地点多关键词**：支持配置多个搜索关键词和目标城市，自动跨维度进行数据采集。
-- **不限地区模式**：在 Web 任务中城市/地区留空时，不进行城市过滤，所有城市的岗位都可以进入结果。
-- **动态延时防封**：支持自定义各类点击、翻页、加载操作的随机等待延时，模拟真人操作。
-- **Headless 模式**：支持无头浏览器后台静默运行。
-- **自动错误重试**：遇到页面加载失败或数据为空时，支持自动刷新重试机制。
-- **全局链接去重**：所有任务共用一个已爬详情链接文件，跨任务、跨重启避免重复访问同一岗位链接。
-- **Web 历史任务持久化**：Web 任务信息会保存到本地，重新打开 Web 程序后仍可查看历史任务。
+1. 安装 Python 依赖。
+2. 安装 GoLogin 桌面端。
+3. 登录 GoLogin，并等待 GoLogin 把 Orbita 浏览器下载完成。
+4. 配置 `.env` 为 `orbita_cdp`、可见浏览器、开启详情页补全。
+5. 先运行一次智联招聘登录态初始化，把登录状态保存到 `auth/zhaopin_profile`。
+6. 正式运行 `python main.py`。
+7. 运行过程中如果弹验证码，手动处理。
+8. 结果写入 `output/关键词.xlsx`。
 
-## 代码结构
+## 安装依赖
 
-- `main.py`：命令行入口和任务编排。
-- `config.py`：`.env`、命令行参数和运行配置解析。
-- `constants.py`：平台 URL、默认配置、城市映射和输出字段定义。
-- `utils.py`：文本清洗、城市判断、延时、参数解析等通用工具。
-- `zhaopin.py`：智联招聘搜索页、详情页解析和抓取流程。
-- `fiftyone.py`：51job 搜索页、登录 Profile、详情页解析和抓取流程。
-- `output.py`：岗位记录归一化、增量合并和 Excel 导出格式化。
-- `web.py` / `web_app.py`：本地 Web 控制台、任务 API、历史任务持久化和页面路由。
-- `static/frontend.js`：Web 前端状态、API 调用和浏览器路由。
-- `static/views.js`：Web 前端页面渲染，包括首页、进行中、历史任务和任务详情。
+进入项目目录：
 
-## 环境要求
+```powershell
+cd D:\-647-main
+```
 
-- Python 3.10+
-- [python-dotenv](https://pypi.org/project/python-dotenv/) (用于读取本地 `.env` 配置)
-- `playwright`、`pandas`、`beautifulsoup4`、`openpyxl`
+安装 Python 依赖：
 
-## 安装步骤
+```powershell
+pip install -r requirements.txt
+```
 
-1. **克隆/下载代码到本地存储库**
-   ```bash
-   cd zhaopin_crawler
-   ```
+这里不需要再按旧 README 去执行 `playwright install chromium` 作为主流程。当前主流程使用本机 Orbita 浏览器；`playwright` 只是连接 Orbita 的 CDP 控制层。
 
-2. **安装依赖**
-   建议使用虚拟环境进行安装：
-   ```bash
-   pip install -r requirements.txt
-   ```
+## 安装 GoLogin 和 Orbita
 
-3. **安装 Playwright 浏览器内核**
-   本项目依赖 Playwright 来驱动浏览器抓取数据。在第一次运行前，您必须下载相关的浏览器二进制文件（由于本项目默认使用 Chrome/Chromium，建议仅安装 Chromium 以节省时间）：
-   ```bash
-   playwright install chromium
-   ```
+官方入口：
 
-## 配置说明
+- GoLogin 下载页：https://gologin.com/download/
+- GoLogin 安装文档：https://gologin.com/docs/getting-started/setup/supported-platforms-installation
 
-项目根目录下需要存在 `.env` 配置文件（如果不存在，请复制一份预设的格式）。
+Windows 上也可以用：
 
-```bash
+```powershell
+winget install --id Gologin.Gologin --exact
+```
+
+安装完成后：
+
+1. 打开 GoLogin。
+2. 登录你的 GoLogin 账号。
+3. 在 GoLogin 里创建或打开一个浏览器 Profile。
+4. 等它自动下载 Orbita 浏览器。
+5. 确认 Orbita 能正常打开。
+
+程序会自动查找常见路径，例如：
+
+```text
+C:\Users\<你的用户名>\.gologin\browser\orbita-browser-xxx\chrome.exe
+```
+
+如果 Orbita 还没下载完，程序会找不到浏览器。这种情况先回到 GoLogin 里等待下载完成，或者手动运行一次 GoLogin Profile。
+
+## 配置 .env
+
+第一次使用时复制配置文件：
+
+```powershell
 copy .env.example .env
 ```
 
-您可以通过修改 `.env` 的以下这些变量来定制抓取行为：
+当前主流程推荐配置如下：
 
-| 配置变量名 | 默认值示例 | 说明 |
-| :--- | :--- | :--- |
-| `KEYWORDS` | "大模型算法工程师,数据分析师,软件开发" | 想要搜索的职位关键词，用英文逗号分隔 |
-| `REGIONS` | "北京,上海,深圳" | 指定抓取的城市/地区列表，用英文逗号分隔；命令行模式为空时会使用 `DEFAULT_REGIONS` |
-| `DEFAULT_REGIONS` | "北京,上海,广州,深圳,杭州" | 命令行模式下 `REGIONS` 读取失败或为空时的备用城市列表 |
-| `MAX_PAGES_PER_REGION`| 5 | 每个地区-关键词组合下最多抓取的页数上限 |
-| `MAX_EMPTY_PAGE_RETRIES`| 2 | 若单次列表加载空白或失败，最大刷新重试次数 |
-| `HEADLESS` | true | 浏览器是否启用无头/静默模式（true 隐藏界面，false 显示界面便于调试） |
-| `USER_AGENT` | "Mozilla/5.0 (...)" | 自定义请求头 User-Agent，用于反检测 |
-| `VIEWPORT_WIDTH` | 1400 | 操作浏览器时的视口宽度 |
-| `VIEWPORT_HEIGHT`| 900 | 操作浏览器时的视口高度 |
-| `DELAY_AFTER_OPEN_SEARCH`| "2.5,4.0" | 打开搜索页后的随机等待时间(秒)，下限与上限使用英文逗号分隔 |
-| `DELAY_BETWEEN_PAGES`| "1.8,3.0" | 点击下一页/翻页过程的随机等待时间(秒)，Web 任务设置中可按任务覆盖 |
-| `DELAY_RETRY_RELOAD`| "4.0,6.0" | 触发异常重试或页面重载时的随机等待冷却时间(秒) |
-| `OUTPUT_DIR` | "output" | 数据抓取结果的输出和保存目录 |
-| `CRAWLED_LINKS_DIR` | "output/crawled_links" | 已访问过的岗位详情链接文本存储目录；所有任务会合并写入同一个 `all_links.txt` |
+```env
+KEYWORDS=教育培训
 
-## 运行项目
+# 留空表示不限地区，也就是不做城市过滤
+REGIONS=
+DEFAULT_REGIONS=
 
-完成环境搭建和 `.env` 配置修改后，使用以下命令启动爬虫：
+MAX_PAGES_PER_REGION=5
 
-```bash
+HEADLESS=false
+MANUAL_AUTH=true
+BROWSER_BACKEND=orbita_cdp
+
+LOGIN_ZHAOPIN=false
+ZHAOPIN_USER_DATA_DIR=auth/zhaopin_profile
+AUTH_WAIT_SECONDS=300
+
+SKIP_DETAIL_FETCH=false
+REFETCH_CRAWLED_DETAILS=false
+
+OUTPUT_DIR=output
+CRAWLED_LINKS_DIR=output/crawled_links
+```
+
+关键配置说明：
+
+| 配置 | 建议值 | 说明 |
+| --- | --- | --- |
+| `KEYWORDS` | `教育培训` | 搜索关键词，多个关键词用英文逗号分隔 |
+| `REGIONS` | 留空 | 留空就是不限地区，抓到哪个城市都保留 |
+| `DEFAULT_REGIONS` | 留空 | 保持留空，避免空地区又被默认城市覆盖 |
+| `MAX_PAGES_PER_REGION` | 按需要 | 每个关键词最多翻多少页 |
+| `HEADLESS` | `false` | 必须显示浏览器，方便处理验证码 |
+| `MANUAL_AUTH` | `true` | 遇到登录/验证时等待人工处理 |
+| `BROWSER_BACKEND` | `orbita_cdp` | 当前主流程，启动 Orbita 并通过 CDP 连接 |
+| `SKIP_DETAIL_FETCH` | `false` | false 才会点进详情页补全工作内容/任职要求 |
+| `REFETCH_CRAWLED_DETAILS` | `false` | 正常跑保持 false；如果以前只抓了列表、详情为空，临时改 true 回补 |
+| `ZHAOPIN_USER_DATA_DIR` | `auth/zhaopin_profile` | 智联登录态保存目录 |
+| `GOLOGIN_TOKEN` | 留空 | `orbita_cdp` 主流程不需要填 |
+| `GOLOGIN_PROFILE_ID` | 留空 | `orbita_cdp` 主流程不需要填 |
+
+## 保存智联登录态
+
+正式抓取前，先用 Orbita 打开一次智联并完成登录：
+
+```powershell
+python main.py --login-zhaopin --auth-wait-seconds 300
+```
+
+程序会打开 Orbita 窗口。你需要在这个窗口里：
+
+1. 登录智联招聘。
+2. 如果出现验证码，手动完成。
+3. 等命令行倒计时结束。
+
+登录态会保存到：
+
+```text
+D:\-647-main\auth\zhaopin_profile
+```
+
+后续正常运行会复用这个目录。不要随便删除 `auth/zhaopin_profile`，否则要重新登录。
+
+## 正式运行
+
+确认 `.env` 配好后运行：
+
+```powershell
 python main.py
 ```
 
-也可以用命令行参数临时覆盖 `.env` 配置：
+正常日志会类似：
 
-```bash
-python main.py --keywords Java开发 --regions 北京,上海 --max-pages 3 --headless
+```text
+Orbita CDP：独立启动 + Playwright 远程连接（无自动化标识条）
+稳妥模式（跳过详情页）：False
+开始抓取智联招聘：关键词=教育培训，地区=不限地区
+正在分析详情链接 (1/20)：...
+第 1 页：解析 20 条，未进行地区过滤，详情补全 20 条，新增 ...
 ```
 
-抓取 51job：
+如果看到：
 
-```bash
-python main.py --platform 51job --keywords Java开发 --regions 上海 --max-pages 1 --headless
+```text
+已启用列表页导出模式：跳过详情页补全
 ```
 
-51job 详情页需要真实登录时，先初始化一个专用浏览器 Profile：
+说明 `SKIP_DETAIL_FETCH` 仍然是 `true`，或者当前命令没有读到你改过的 `.env`。
 
-```bash
-python main.py --platform 51job --login-51job --auth-wait-seconds 180
+## 验证码和人工处理
+
+这个版本不是全自动无人值守验证码版本。正确姿势是：
+
+- 浏览器窗口必须显示出来。
+- 第一次进入详情页时，可能会弹验证码。
+- 后面跑多页时，也可能隔一段时间再弹。
+- 弹出来就手动点，点完程序会继续。
+- 不要开无头模式，不要把 `HEADLESS` 改成 `true`。
+
+如果长时间没有继续输出，可以看 Orbita 窗口是不是停在验证页、登录页或异常页。
+
+## 输出和保险机制
+
+主结果文件在：
+
+```text
+output\关键词.xlsx
 ```
 
-在弹出的浏览器中用手机号和短信验证码完成真实登录。程序会把登录状态保存在 `auth/51job_profile`。之后正常抓取 51job 时会复用这个 Profile，并尝试补全详情页中的 `工作内容` 和 `任职要求`：
+例如：
 
-```bash
-python main.py --platform 51job --keywords Java开发 --regions 上海 --max-pages 1 --headless
+```text
+output\教育培训.xlsx
 ```
 
-常用参数：
+写入逻辑是增量合并：
 
-- `--platform`：招聘平台，支持 `zhaopin` 和 `51job`。
-- `--login-51job`：打开真实浏览器，等待人工用手机号/短信验证码登录 51job，并保存 Profile。
-- `--auth-wait-seconds`：人工登录等待秒数。
-- `--user-data-dir`：51job 登录 Profile 保存/读取目录。
-- `--keywords`：本次运行的岗位关键词，多个值用英文逗号分隔。
-- `--regions`：本次运行的城市/地区，多个值用英文逗号分隔。
-- `--max-pages`：每个“关键词 + 城市”最多抓取页数。
-- `--headless` / `--headed`：分别表示隐藏或显示浏览器窗口。
-- `--output-dir`：本次运行的输出目录。
-- `--max-empty-retries`：列表页解析为空时的最大重试次数。
-- `--max-detail-retries`：详情页抓取失败时的最大重试次数。
+- 优先按 `岗位链接` 去重。
+- 如果没有链接，再按 `公司名称 + 岗位名称 + 城市` 去重。
+- 已存在岗位如果补到了新的 `工作内容/任职要求`，会更新旧记录。
 
-## Web 控制台
+当前版本已经加了 Excel 保险机制：
 
-启动本地 Web 程序：
+1. 写 Excel 时会先写临时文件，再替换主文件。
+2. 如果 `output\教育培训.xlsx` 被 Excel/WPS 占用，程序不会直接崩掉，会另存为：
 
-```bash
-python web_app.py
+```text
+output\教育培训_recovered_YYYYMMDD_HHMMSS.xlsx
 ```
 
-默认访问地址：
+3. CLI 抓取过程中还会持续写断点备份：
 
-- 首页/任务设置：`http://127.0.0.1:5000/`
-- 进行中任务：`http://127.0.0.1:5000/tasks`
-- 历史任务：`http://127.0.0.1:5000/history`
-- 任务详情：`http://127.0.0.1:5000/tasks/<任务ID>` 或 `http://127.0.0.1:5000/history/<任务ID>`
+```text
+output\checkpoints\关键词_YYYYMMDD_HHMMSS.jsonl
+```
 
-Web 任务设置说明：
+建议：运行程序时尽量关掉正在打开的结果 Excel。保险机制能兜底，但最稳的方式还是不要让 WPS/Excel 占用目标文件。
 
-- 城市/地区可以留空；留空时不按城市过滤，抓到哪个城市都可以进入结果。
-- `翻页等待秒` 对应 `.env` 中的 `DELAY_BETWEEN_PAGES`，格式为 `下限,上限`，例如 `1.8,3.0`。
-- Web 任务信息会保存到 `web_tasks/<任务ID>/task.json`，重新启动 Web 程序后自动读取历史任务。
-- Web 任务结果仍保存在各自任务目录下，例如 `web_tasks/<任务ID>/output/`。
+## 长时间挂机脚本
 
-## 数据输出
+主流程仍然是：
 
-爬行结束或进行中时，抓取到的数据将会默认自动保存到项目的 `OUTPUT_DIR` (默认为 `output/` 文件夹) 目录下。
-您可以在此文件夹内获取结构化后的职位招聘列表数据。
+```powershell
+python main.py
+```
 
-Web 任务的输出文件保存在 `web_tasks/<任务ID>/output/`，可在任务详情页预览和下载。
+如果你想长时间跑，可以用临时挂机脚本：
 
-所有已访问过的岗位详情链接统一保存在 `CRAWLED_LINKS_DIR/all_links.txt`。后续无论创建多少任务、重启多少次程序，已记录的链接都会被跳过；列表内去重也会优先按岗位链接判断，只有缺少链接时才回退到公司、岗位和城市组合。
+```powershell
+python long_run.py
+```
 
-当前输出表头与“岗位信息表.xlsx”的 Sheet1 保持一致：
+它会循环启动 `main.py`，每轮完成后随机冷却一段时间，异常退出也会等待后重试。手动结束用 `Ctrl+C`。
 
-`序号 | 招聘平台 | 岗位类别/大类 | 岗位名称 | 公司名称 | 公司规模 | 所在省份 | 城市 | 详细地址 | 学历要求 | 经验要求 | 薪资范围 | 福利标签 | 工作内容 | 任职要求 | 岗位链接 | 投递起始时间 | 投递截止时间 | 备注`
+常用测试：
 
-网页中无法提取到的字段会统一填充为 `/`。
+```powershell
+python long_run.py --once
+python long_run.py --dry-run
+```
+
+这个脚本只是为了长时间挂机更稳，不是必须流程。
+
+## 旧流程和可选能力
+
+仓库里还保留了一些旧后端和可选入口，例如：
+
+- `BROWSER_BACKEND=playwright`
+- `BROWSER_BACKEND=scrapling`
+- `BROWSER_BACKEND=gologin`
+- `BROWSER_BACKEND=adspower`
+- `python web_app.py`
+- 51job 相关流程
+
+这些不是当前已经跑通并推荐使用的智联主流程。当前主流程请优先按本文档配置：
+
+```env
+BROWSER_BACKEND=orbita_cdp
+HEADLESS=false
+MANUAL_AUTH=true
+SKIP_DETAIL_FETCH=false
+```
+
+## 常见问题
+
+### 1. 地区留空为什么是不限地区？
+
+现在 CLI 已经按这个逻辑处理：`REGIONS=` 且 `DEFAULT_REGIONS=` 时，会把地区作为一个空值任务执行，显示为 `不限地区`，不做城市过滤。
+
+### 2. 为什么跑了很多条，最后新增很少？
+
+页面日志里的“新增”是本轮抓取时的去重累计；最终写 Excel 时还会和旧 Excel 合并去重。如果旧文件里已经有相同岗位链接，就不会算新增，只会在字段变化时算更新。
+
+### 3. 为什么没有点详情页？
+
+检查：
+
+```env
+SKIP_DETAIL_FETCH=false
+HEADLESS=false
+MANUAL_AUTH=true
+```
+
+看到“正在分析详情链接”才说明详情页补全正在执行。
+
+### 4. 以前只抓了列表，详情字段都是空，怎么回补？
+
+临时改：
+
+```env
+REFETCH_CRAWLED_DETAILS=true
+```
+
+跑完回补后建议改回：
+
+```env
+REFETCH_CRAWLED_DETAILS=false
+```
+
+### 5. 报 `PermissionError: output\教育培训.xlsx`
+
+说明 Excel/WPS 正在占用文件。关掉表格后重跑。当前版本也会自动另存 recovered 文件，避免整轮白跑。
+
+### 6. 找不到 Orbita 浏览器？
+
+先打开 GoLogin，登录账号，并启动一个 Profile，让 GoLogin 把 Orbita 下载完整。下载完成后再运行 `python main.py`。
+
+## 主要文件
+
+| 文件 | 说明 |
+| --- | --- |
+| `main.py` | CLI 主入口 |
+| `long_run.py` | 长时间挂机包装脚本 |
+| `job_crawler/zhaopin.py` | 智联招聘列表页和详情页抓取 |
+| `job_crawler/orbita_cdp_backend.py` | 启动 Orbita，并通过 CDP 连接 |
+| `job_crawler/output.py` | Excel 增量合并、格式化、recovered 保险写入 |
+| `job_crawler/crawled_links.py` | 已抓详情链接记录 |
+| `.env` | 本机运行配置，不提交 |
+| `.env.example` | 配置模板 |
+
+## 输出字段
+
+Excel 表头为：
+
+```text
+序号 | 招聘平台 | 岗位类型一级 | 岗位类型二级 | 岗位名称 | 岗位类型企业/公务员/事业单位/军队文职 | 公司名称 | 公司规模 | 所在省份 | 城市 | 详细地址 | 学历要求 | 经验要求 | 薪资范围 | 福利标签 | 工作内容 | 任职要求 | 岗位链接 | 发布时间 | 投递起始时间 | 投递截止时间 | 证书要求 | 备注
+```
+
+网页中拿不到的字段会填 `/`。

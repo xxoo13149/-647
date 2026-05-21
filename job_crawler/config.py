@@ -114,6 +114,11 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="稳妥模式：只使用列表页字段导出，跳过详情页抓取，降低触发验证风险。",
     )
+    parser.add_argument(
+        "--refetch-crawled-details",
+        action="store_true",
+        help="即使详情链接已有历史记录，也重新打开详情页补全。",
+    )
     return parser.parse_args(argv)
 
 
@@ -157,6 +162,8 @@ def apply_cli_overrides(
 
     if args.skip_detail_fetch:
         merged["skip_detail_fetch"] = True
+    if args.refetch_crawled_details:
+        merged["refetch_crawled_details"] = True
 
     if args.headless:
         merged["headless"] = True
@@ -269,9 +276,6 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
                 if normalized not in seen:
                     seen.add(normalized)
                     regions.append(normalized)
-
-    if not regions:
-        raise ValueError("地区解析为空，请检查 .env 中的 REGIONS/DEFAULT_REGIONS")
 
     base_dir = env_path.parent
     output_dir_raw = clean_text(os.getenv("OUTPUT_DIR", "output")) or "output"
@@ -467,6 +471,10 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
             os.getenv("SKIP_DETAIL_FETCH", str(DEFAULT_CONFIG["skip_detail_fetch"])),
             bool(DEFAULT_CONFIG["skip_detail_fetch"]),
         ),
+        "refetch_crawled_details": parse_bool(
+            os.getenv("REFETCH_CRAWLED_DETAILS", str(DEFAULT_CONFIG["refetch_crawled_details"])),
+            bool(DEFAULT_CONFIG["refetch_crawled_details"]),
+        ),
         "yescaptcha_api_key": clean_text(os.getenv("YESCAPTCHA_API_KEY", "")),
         "yescaptcha_proxy": clean_text(os.getenv("YESCAPTCHA_PROXY", "")),
     }
@@ -480,7 +488,8 @@ def load_env_config(env_path: Path) -> dict[str, Any]:
 def print_config_summary(settings: dict[str, Any], env_path: Path) -> None:
     """打印本次任务配置摘要。"""
     keywords = "、".join(settings["keywords"])
-    regions = "、".join(settings["regions"])
+    regions = "、".join(settings["regions"]) if settings["regions"] else "不限地区"
+    region_count = len(settings["regions"]) if settings["regions"] else 1
 
     print(f"已加载配置：{env_path}")
     print(f"关键词：{keywords}")
@@ -522,6 +531,7 @@ def print_config_summary(settings: dict[str, Any], env_path: Path) -> None:
     if settings["browser_backend"] == "orbita_cdp":
         print("Orbita CDP：独立启动 + Playwright 远程连接（无自动化标识条）")
     print(f"稳妥模式（跳过详情页）：{settings['skip_detail_fetch']}")
+    print(f"历史详情链接强制重抓：{settings['refetch_crawled_details']}")
     print(f"输出目录：{settings['output_dir']}")
     print(f"已爬取链接目录：{settings['crawled_links_dir']}")
-    print(f"批量任务数：{len(settings['keywords']) * len(settings['regions'])}")
+    print(f"批量任务数：{len(settings['keywords']) * region_count}")

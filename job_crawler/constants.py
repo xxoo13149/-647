@@ -60,6 +60,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "scrapling_block_webrtc": True,
     "scrapling_hide_canvas": True,
     "skip_detail_fetch": True,
+    "refetch_crawled_details": False,
     "auto_restart_on_verify": False,
     "max_restart_attempts": 3,
     "yescaptcha_proxy": "",

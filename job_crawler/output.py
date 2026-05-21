@@ -1,3 +1,7 @@
+import os
+import json
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -196,10 +200,24 @@ def build_record_key(record: dict[str, str]) -> tuple[str, ...]:
     )
 
 
-def write_job_records_to_excel(file_path: Path, records: list[dict[str, str]]) -> None:
+def build_fallback_output_path(file_path: Path) -> Path:
+    """Build a unique fallback path when the target workbook is locked."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = file_path.with_name(f"{file_path.stem}_recovered_{stamp}{file_path.suffix}")
+    if not base.exists():
+        return base
+
+    for index in range(2, 1000):
+        candidate = file_path.with_name(f"{file_path.stem}_recovered_{stamp}_{index}{file_path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return file_path.with_name(f"{file_path.stem}_recovered_{stamp}_{os.getpid()}{file_path.suffix}")
+
+
+def write_job_records_to_excel(file_path: Path, records: list[dict[str, str]]) -> Path:
     """将岗位记录写入 Excel，并按 20 条一页拆分为多个工作表。"""
     if not records:
-        return
+        return file_path
 
     df = pd.DataFrame(records)
     for column in OUTPUT_COLUMNS:
@@ -207,8 +225,13 @@ def write_job_records_to_excel(file_path: Path, records: list[dict[str, str]]) -
             df[column] = ""
     df = df[OUTPUT_COLUMNS].fillna("")
 
+    file_path = Path(file_path)
+    temp_path = file_path.with_name(
+        f".{file_path.stem}.{os.getpid()}.{int(time.time() * 1000)}.tmp{file_path.suffix}"
+    )
+
     pages = max(1, (len(df) + PAGE_SIZE - 1) // PAGE_SIZE)
-    with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+    with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
         for page_index in range(pages):
             start = page_index * PAGE_SIZE
             end = start + PAGE_SIZE
@@ -217,7 +240,68 @@ def write_job_records_to_excel(file_path: Path, records: list[dict[str, str]]) -
             sheet_name = f"第{page_index + 1}页"
             page_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
-    format_output_workbook(file_path)
+    format_output_workbook(temp_path)
+
+    try:
+        os.replace(temp_path, file_path)
+        return file_path
+    except PermissionError as exc:
+        fallback_path = build_fallback_output_path(file_path)
+        os.replace(temp_path, fallback_path)
+        print(
+            f"警告：目标 Excel 正在被占用，无法覆盖：{file_path}，原因：{exc}；"
+            f"本轮结果已另存为：{fallback_path}"
+        )
+        return fallback_path
+    except OSError as exc:
+        fallback_path = build_fallback_output_path(file_path)
+        os.replace(temp_path, fallback_path)
+        print(
+            f"警告：目标 Excel 写入失败：{file_path}，原因：{exc}；"
+            f"本轮结果已另存为：{fallback_path}"
+        )
+        return fallback_path
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def append_jobs_checkpoint(
+    jobs: list[dict],
+    output_dir: Path,
+    keyword: str,
+    session_id: str,
+    context: dict[str, Any] | None = None,
+) -> Path | None:
+    """Append normalized jobs to a JSONL checkpoint so long CLI runs can be recovered."""
+    if not jobs:
+        return None
+
+    checkpoint_dir = Path(output_dir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    base_name = sanitize_filename(keyword, fallback="未知关键词")
+    checkpoint_path = checkpoint_dir / f"{base_name}_{session_id}.jsonl"
+    context = context or {}
+    checkpoint_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with checkpoint_path.open("a", encoding="utf-8") as handle:
+        for item in jobs:
+            record = normalize_job_record(item)
+            payload = {
+                "_checkpoint_time": checkpoint_time,
+                "_keyword": keyword,
+                "_platform": context.get("platform", ""),
+                "_region": context.get("region", ""),
+                "_page": context.get("page", ""),
+                "_detail_index": context.get("detail_index", ""),
+                **record,
+            }
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    return checkpoint_path
 
 
 def format_output_workbook(file_path: Path) -> None:
@@ -297,10 +381,12 @@ def save_jobs_by_keyword(jobs: list[dict], output_dir: Path, keyword: str) -> di
         new_records=normalized_jobs,
     )
 
-    write_job_records_to_excel(file_path, merged_records)
+    saved_path = write_job_records_to_excel(file_path, merged_records)
+    target_text = str(file_path) if saved_path == file_path else f"{saved_path}（主文件被占用，已另存）"
     print(
-        f"关键词《{keyword}》写入完成：新增 {appended_count} 条，"
-        f"更新 {updated_count} 条，当前共 {len(merged_records)} 条 -> {file_path}"
+        f"关键词《{keyword}》写入完成：本轮采集 {len(normalized_jobs)} 条，"
+        f"新增入库 {appended_count} 条，更新 {updated_count} 条，"
+        f"原有 {len(existing_records)} 条，当前共 {len(merged_records)} 条 -> {target_text}"
     )
 
     return {
@@ -308,5 +394,5 @@ def save_jobs_by_keyword(jobs: list[dict], output_dir: Path, keyword: str) -> di
         "raw_count": len(jobs),
         "appended_count": appended_count,
         "updated_count": updated_count,
-        "saved_files": [str(file_path)],
+        "saved_files": [str(saved_path)],
     }
