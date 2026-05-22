@@ -2,6 +2,7 @@ import { createApp } from "./nanofront.js";
 import { dashboard, taskIsActive } from "./views.js";
 
 const AUTO_REFRESH_MS = 2500;
+let saveDefaultsTimer = null;
 
 const initialForm = {
   name: "",
@@ -10,7 +11,9 @@ const initialForm = {
   regions: "北京,广州,上海",
   max_pages: "1",
   headless: true,
-  skip_detail_fetch: true,
+  skip_detail_fetch: false,
+  refetch_crawled_details: false,
+  filter_existing_output_early: false,
   max_empty_retries: "2",
   max_detail_retries: "1",
   detail_timeout_ms: "90000",
@@ -87,6 +90,14 @@ function normalizeDefaults(defaults) {
       normalized.skip_detail_fetch = Boolean(value);
       continue;
     }
+    if (key === "refetch_crawled_details") {
+      normalized.refetch_crawled_details = Boolean(value);
+      continue;
+    }
+    if (key === "filter_existing_output_early") {
+      normalized.filter_existing_output_early = Boolean(value);
+      continue;
+    }
     const text = String(value ?? "").trim();
     if (text) {
       normalized[key] = text;
@@ -130,11 +141,28 @@ function syncFormState(app) {
     max_pages: data.get("max_pages") || "1",
     headless: data.has("headless"),
     skip_detail_fetch: data.get("skip_detail_fetch") !== "false",
+    refetch_crawled_details: data.has("refetch_crawled_details"),
+    filter_existing_output_early: data.has("filter_existing_output_early"),
     max_empty_retries: data.get("max_empty_retries") || "2",
     max_detail_retries: data.get("max_detail_retries") || "1",
     detail_timeout_ms: data.get("detail_timeout_ms") || "90000",
     delay_between_pages: data.get("delay_between_pages") || "1.8,3.0",
   };
+}
+
+function scheduleDefaultsSave(app) {
+  syncFormState(app);
+  if (saveDefaultsTimer) {
+    clearTimeout(saveDefaultsTimer);
+  }
+  saveDefaultsTimer = setTimeout(async () => {
+    try {
+      const saved = await apiJson("/api/defaults", { method: "POST", payload: app.state.form });
+      app.state.defaults = normalizeDefaults(saved);
+    } catch {
+      // Ignore background save errors to avoid interrupting typing.
+    }
+  }, 250);
 }
 
 function applyRoute(app, route = parseRoute()) {
@@ -220,6 +248,8 @@ const app = createApp({
       const payload = { ...app.state.form };
       app.setState({ error: "" });
       try {
+        const savedDefaults = await apiJson("/api/defaults", { method: "POST", payload });
+        app.state.defaults = normalizeDefaults(savedDefaults);
         const task = await apiJson("/api/tasks", { method: "POST", payload });
         app.state.selectedTask = task;
         app.state.dataCollapsed = true;
@@ -265,9 +295,17 @@ const app = createApp({
         app.setState({ error: error.message });
       }
     },
-    resetDefaults(app) {
-      app.state.form = { ...app.state.defaults, name: "" };
-      app.render();
+    async resetDefaults(app) {
+      try {
+        app.setState({ error: "" });
+        const defaults = await apiJson("/api/defaults/reset", { method: "POST" });
+        const normalized = normalizeDefaults(defaults);
+        app.state.defaults = normalized;
+        app.state.form = { ...normalized };
+        app.render();
+      } catch (error) {
+        app.setState({ error: error.message });
+      }
     },
     async openDetail(app, id) {
       const sourcePage = app.state.page === "history" ? "history" : "tasks";
@@ -322,6 +360,14 @@ app.onRender((app) => {
   document.querySelector("[data-role='task-form']")?.addEventListener("submit", (event) => {
     event.preventDefault();
     app.actions.createTask();
+  });
+
+  document.querySelector("[data-role='task-form']")?.addEventListener("input", () => {
+    scheduleDefaultsSave(app);
+  });
+
+  document.querySelector("[data-role='task-form']")?.addEventListener("change", () => {
+    scheduleDefaultsSave(app);
   });
 
   document.querySelectorAll("[data-route]").forEach((element) => {

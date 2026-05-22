@@ -38,7 +38,7 @@ def using_orbita_cdp(settings: dict[str, Any]) -> bool:
 
 
 def _orbita_launch_args(executable_path: str | None = None) -> list[str]:
-    """Orbita 浏览器启动参数（最少化，Orbita 二进制已内置完整反检测）。"""
+    """Orbita 浏览器启动参数（含 automation 屏蔽，Orbita 二进制已内置完整反检测）。"""
     return [
         "--excludeSwitches=enable-automation",
         "--password-store=basic",

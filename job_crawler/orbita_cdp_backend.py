@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # 默认 CDP 端口范围
 CDP_PORT_START = 9223
-CDP_PORT_END = 9230
+CDP_PORT_END = 9240
 
 
 def _find_free_port(start: int = CDP_PORT_START, end: int = CDP_PORT_END) -> int:
@@ -70,13 +70,20 @@ async def launch_orbita_browser(
 
     # 清理锁文件
     profile = Path(user_data_dir)
+    import time
     for lock_name in ["lockfile", "SingletonLock", "SingletonSocket"]:
-        (profile / lock_name).unlink(missing_ok=True)
+        for _ in range(3):
+            try:
+                (profile / lock_name).unlink(missing_ok=True)
+                break
+            except (PermissionError, OSError):
+                time.sleep(1)
 
     cmd = [
         orbita_exe,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile}",
+        "--excludeSwitches=enable-automation",
         "--no-first-run",
         "--no-default-browser-check",
         "--password-store=basic",
@@ -89,8 +96,8 @@ async def launch_orbita_browser(
     logger.info("Orbita CDB: starting %s", " ".join(str(c) for c in cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 等待 CDP 就绪（最多 30 秒）
-    for i in range(60):
+    # 等待 CDP 就绪（最多 60 秒）
+    for i in range(120):
         await asyncio.sleep(0.5)
         if _cdp_ready(port, timeout=0.5):
             break
@@ -119,6 +126,7 @@ def stop_orbita_browser(proc: subprocess.Popen | None) -> None:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=3)
     except Exception:
         pass
 

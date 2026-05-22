@@ -59,7 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "scrapling_google_search": False,
     "scrapling_block_webrtc": True,
     "scrapling_hide_canvas": True,
-    "skip_detail_fetch": True,
+    "skip_detail_fetch": False,
     "refetch_crawled_details": False,
     "filter_existing_output_early": False,
     "auto_restart_on_verify": False,

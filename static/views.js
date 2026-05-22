@@ -197,6 +197,16 @@ function taskForm(form, submitText = "新增任务") {
           <option value="false"${!form.skip_detail_fetch ? " selected" : ""}>完整模式：进入详情页补全信息</option>
         </select>
       </div>
+      <div class="field grid-2">
+        <label class="check-row">
+          <input name="filter_existing_output_early" type="checkbox"${form.filter_existing_output_early ? " checked" : ""} />
+          <span>提前过滤 Excel 已有岗位</span>
+        </label>
+        <label class="check-row">
+          <input name="refetch_crawled_details" type="checkbox"${form.refetch_crawled_details ? " checked" : ""} />
+          <span>强制回补历史详情页</span>
+        </label>
+      </div>
       <div class="field">
         <label for="keywords">关键词</label>
         <textarea id="keywords" name="keywords" placeholder="多个关键词用英文逗号分隔">${escapeHtml(form.keywords)}</textarea>
@@ -229,7 +239,8 @@ function taskForm(form, submitText = "新增任务") {
       </label>
       <div class="muted">
         智联招聘任务会自动改为有界面运行。
-        稳妥模式默认开启，更适合现在的风控环境；完整模式会尝试进入详情页，信息更全，但更容易触发验证。
+        完整模式默认开启，会进入详情页补全“工作内容 / 任职要求”；如果验证过于频繁，再切回稳妥模式。
+        “提前过滤”适合增量抓取；“强制回补”适合补历史表缺失详情，但风险和耗时都会更高。
       </div>
       <button class="primary" type="submit">${submitText}</button>
     </form>
@@ -267,6 +278,8 @@ function homePage(app) {
         <div class="settings-list">
           <div><span>默认平台</span><strong>${escapeHtml(state.defaults.platform)}</strong></div>
           <div><span>默认模式</span><strong>${escapeHtml(state.defaults.skip_detail_fetch ? "稳妥模式" : "完整模式")}</strong></div>
+          <div><span>提前过滤已有 Excel</span><strong>${escapeHtml(state.defaults.filter_existing_output_early ? "开启" : "关闭")}</strong></div>
+          <div><span>强制回补历史详情</span><strong>${escapeHtml(state.defaults.refetch_crawled_details ? "开启" : "关闭")}</strong></div>
           <div><span>默认关键词</span><strong>${escapeHtml(state.defaults.keywords || "未配置")}</strong></div>
           <div><span>默认地区</span><strong>${escapeHtml(state.defaults.regions || "不限地区")}</strong></div>
           <div><span>翻页等待</span><strong>${escapeHtml(state.defaults.delay_between_pages || "1.8,3.0")} 秒</strong></div>
@@ -405,6 +418,9 @@ function detailPage(app) {
         <div><span>地区</span><strong>${escapeHtml(formatRegions(task.regions))}</strong></div>
         <div><span>页数</span><strong>${escapeHtml(task.max_pages)}</strong></div>
         <div><span>模式</span><strong>${escapeHtml(task.headless ? "无头" : "有界面")}</strong></div>
+        <div><span>抓取策略</span><strong>${escapeHtml(task.skip_detail_fetch ? "稳妥模式" : "完整模式")}</strong></div>
+        <div><span>提前过滤</span><strong>${escapeHtml(task.filter_existing_output_early ? "开启" : "关闭")}</strong></div>
+        <div><span>历史回补</span><strong>${escapeHtml(task.refetch_crawled_details ? "开启" : "关闭")}</strong></div>
         <div><span>开始</span><strong>${escapeHtml(task.started_at || "-")}</strong></div>
         <div><span>结束</span><strong>${escapeHtml(task.finished_at || "-")}</strong></div>
       </div>

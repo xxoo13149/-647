@@ -22,7 +22,7 @@ from .utils import (
     split_job_summary,
 )
 
-PAGE_SIZE = 20
+OUTPUT_SHEET_NAME = "Sheet1"
 
 
 def normalize_job_record(item: dict[str, Any]) -> dict[str, str]:
@@ -231,7 +231,7 @@ def build_fallback_output_path(file_path: Path) -> Path:
 
 
 def write_job_records_to_excel(file_path: Path, records: list[dict[str, str]]) -> Path:
-    """将岗位记录写入 Excel，并按 20 条一页拆分为多个工作表。"""
+    """将岗位记录写入单个工作表。"""
     if not records:
         return file_path
 
@@ -246,15 +246,9 @@ def write_job_records_to_excel(file_path: Path, records: list[dict[str, str]]) -
         f".{file_path.stem}.{os.getpid()}.{int(time.time() * 1000)}.tmp{file_path.suffix}"
     )
 
-    pages = max(1, (len(df) + PAGE_SIZE - 1) // PAGE_SIZE)
+    df.insert(0, "序号", range(1, len(df) + 1))
     with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
-        for page_index in range(pages):
-            start = page_index * PAGE_SIZE
-            end = start + PAGE_SIZE
-            page_df = df.iloc[start:end].copy()
-            page_df.insert(0, "序号", range(start + 1, min(end, len(df)) + 1))
-            sheet_name = f"第{page_index + 1}页"
-            page_df.to_excel(writer, index=False, sheet_name=sheet_name)
+        df.to_excel(writer, index=False, sheet_name=OUTPUT_SHEET_NAME)
 
     format_output_workbook(temp_path)
 

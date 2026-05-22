@@ -26,6 +26,26 @@ from .zhaopin import crawl_zhaopin, login_zhaopin_profile
 BASE_DIR = Path(__file__).resolve().parents[1]
 TASKS_DIR = BASE_DIR / "web_tasks"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
+WEB_UI_CONFIG_PATH = TASKS_DIR / "ui_defaults.json"
+UI_DEFAULT_KEYS = {
+    "keywords",
+    "regions",
+    "platform",
+    "browser_backend",
+    "max_pages",
+    "headless",
+    "max_empty_retries",
+    "max_detail_retries",
+    "detail_timeout_ms",
+    "delay_between_pages",
+    "scrapling_real_chrome",
+    "scrapling_google_search",
+    "scrapling_block_webrtc",
+    "scrapling_hide_canvas",
+    "skip_detail_fetch",
+    "refetch_crawled_details",
+    "filter_existing_output_early",
+}
 
 app = Flask(
     __name__,
@@ -192,6 +212,9 @@ class CrawlerTask:
     finished_at: str = ""
     max_pages: int = 1
     headless: bool = True
+    skip_detail_fetch: bool = False
+    refetch_crawled_details: bool = False
+    filter_existing_output_early: bool = False
     raw_count: int = 0
     appended_count: int = 0
     updated_count: int = 0
@@ -222,6 +245,9 @@ class CrawlerTask:
             "finished_at": self.finished_at,
             "max_pages": self.max_pages,
             "headless": self.headless,
+            "skip_detail_fetch": self.skip_detail_fetch,
+            "refetch_crawled_details": self.refetch_crawled_details,
+            "filter_existing_output_early": self.filter_existing_output_early,
             "raw_count": self.raw_count,
             "appended_count": self.appended_count,
             "updated_count": self.updated_count,
@@ -247,6 +273,9 @@ class CrawlerTask:
             finished_at=str(payload.get("finished_at") or ""),
             max_pages=int(payload.get("max_pages") or 1),
             headless=bool(payload.get("headless", True)),
+            skip_detail_fetch=bool(payload.get("skip_detail_fetch", False)),
+            refetch_crawled_details=bool(payload.get("refetch_crawled_details", False)),
+            filter_existing_output_early=bool(payload.get("filter_existing_output_early", False)),
             raw_count=int(payload.get("raw_count") or 0),
             appended_count=int(payload.get("appended_count") or 0),
             updated_count=int(payload.get("updated_count") or 0),
@@ -418,6 +447,105 @@ def load_base_settings() -> dict[str, Any]:
     return load_env_config(env_path)
 
 
+def build_defaults_payload(settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "keywords": ",".join(settings["keywords"]),
+        "regions": ",".join(settings["regions"]),
+        "platform": settings["platform"],
+        "browser_backend": settings["browser_backend"],
+        "max_pages": settings["max_pages_per_region"],
+        "headless": settings["headless"],
+        "max_empty_retries": settings["max_empty_page_retries"],
+        "max_detail_retries": settings["max_detail_retries"],
+        "detail_timeout_ms": settings["detail_page_timeout_ms"],
+        "delay_between_pages": ",".join(str(value) for value in settings["delays"]["between_pages"]),
+        "auth_wait_seconds": settings["auth_wait_seconds"],
+        "user_data_dir": str(settings["user_data_dir"]),
+        "profile_ready": profile_ready(Path(settings["user_data_dir"])),
+        "zhaopin_user_data_dir": str(settings["zhaopin_user_data_dir"]),
+        "zhaopin_profile_ready": profile_ready(Path(settings["zhaopin_user_data_dir"])),
+        "scrapling_real_chrome": settings["scrapling_real_chrome"],
+        "scrapling_google_search": settings["scrapling_google_search"],
+        "scrapling_block_webrtc": settings["scrapling_block_webrtc"],
+        "scrapling_hide_canvas": settings["scrapling_hide_canvas"],
+        "skip_detail_fetch": settings["skip_detail_fetch"],
+        "refetch_crawled_details": settings["refetch_crawled_details"],
+        "filter_existing_output_early": settings["filter_existing_output_early"],
+        "gologin_token_set": bool(settings.get("gologin_token", "")),
+        "gologin_profile_id": settings.get("gologin_profile_id", ""),
+    }
+
+
+def ui_defaults_fallback_payload() -> dict[str, Any]:
+    return {
+        "keywords": "",
+        "regions": "",
+        "platform": "zhaopin",
+        "browser_backend": "playwright",
+        "max_pages": 1,
+        "headless": True,
+        "max_empty_retries": 2,
+        "max_detail_retries": 1,
+        "detail_timeout_ms": 90000,
+        "delay_between_pages": "1.8,3.0",
+        "auth_wait_seconds": 120,
+        "user_data_dir": str(BASE_DIR / "auth" / "51job_profile"),
+        "profile_ready": False,
+        "zhaopin_user_data_dir": str(BASE_DIR / "auth" / "zhaopin_profile"),
+        "zhaopin_profile_ready": False,
+        "scrapling_real_chrome": False,
+        "scrapling_google_search": False,
+        "scrapling_block_webrtc": True,
+        "scrapling_hide_canvas": True,
+        "skip_detail_fetch": False,
+        "refetch_crawled_details": False,
+        "filter_existing_output_early": False,
+        "gologin_token_set": False,
+        "gologin_profile_id": "",
+    }
+
+
+def load_ui_defaults() -> dict[str, Any]:
+    try:
+        payload = build_defaults_payload(load_base_settings())
+    except Exception:
+        payload = ui_defaults_fallback_payload()
+
+    if WEB_UI_CONFIG_PATH.exists():
+        try:
+            saved = json.loads(WEB_UI_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                for key in UI_DEFAULT_KEYS:
+                    if key in saved:
+                        payload[key] = saved[key]
+        except Exception:
+            pass
+    return payload
+
+
+def save_ui_defaults(payload: dict[str, Any]) -> None:
+    current: dict[str, Any] = {}
+    if WEB_UI_CONFIG_PATH.exists():
+        try:
+            saved = json.loads(WEB_UI_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                for key in UI_DEFAULT_KEYS:
+                    if key in saved:
+                        current[key] = saved[key]
+        except Exception:
+            current = {}
+
+    for key in UI_DEFAULT_KEYS:
+        if key in payload:
+            current[key] = payload[key]
+    WEB_UI_CONFIG_PATH.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def reset_ui_defaults() -> None:
+    if WEB_UI_CONFIG_PATH.exists():
+        WEB_UI_CONFIG_PATH.unlink()
+
+
 def build_settings_for_task(task: CrawlerTask, payload: dict[str, Any]) -> dict[str, Any]:
     settings = load_base_settings()
     global_crawled_links_dir = Path(settings["crawled_links_dir"])
@@ -435,12 +563,9 @@ def build_settings_for_task(task: CrawlerTask, payload: dict[str, Any]) -> dict[
     ]
     settings["login_51job"] = False
     if task.platform == "zhaopin":
-        # 仅在非 gologin 模式下强制 playwright；gologin 模式保持自身后端
-        if settings.get("browser_backend", "playwright") != "gologin":
-            settings["browser_backend"] = "playwright"
+        # Web 控制台与 CLI 保持同一套浏览器后端选择，不再强制改成 playwright
         settings["headless"] = False
         settings["manual_auth"] = True
-        settings["skip_detail_fetch"] = False
 
     if payload.get("max_empty_retries"):
         settings["max_empty_page_retries"] = max(1, int(payload["max_empty_retries"]))
@@ -465,6 +590,10 @@ def build_settings_for_task(task: CrawlerTask, payload: dict[str, Any]) -> dict[
         settings["scrapling_hide_canvas"] = parse_bool(payload.get("scrapling_hide_canvas"), True)
     if payload.get("skip_detail_fetch") is not None:
         settings["skip_detail_fetch"] = parse_bool(payload.get("skip_detail_fetch"), False)
+    if payload.get("refetch_crawled_details") is not None:
+        settings["refetch_crawled_details"] = parse_bool(payload.get("refetch_crawled_details"), False)
+    if payload.get("filter_existing_output_early") is not None:
+        settings["filter_existing_output_early"] = parse_bool(payload.get("filter_existing_output_early"), False)
 
     settings["output_dir"].mkdir(parents=True, exist_ok=True)
     settings["crawled_links_dir"].mkdir(parents=True, exist_ok=True)
@@ -728,58 +857,20 @@ def index(task_id: str | None = None):
 
 @app.get("/api/defaults")
 def api_defaults():
-    try:
-        settings = load_base_settings()
-        payload = {
-            "keywords": ",".join(settings["keywords"]),
-            "regions": ",".join(settings["regions"]),
-            "platform": settings["platform"],
-            "browser_backend": settings["browser_backend"],
-            "max_pages": settings["max_pages_per_region"],
-            "headless": settings["headless"],
-            "max_empty_retries": settings["max_empty_page_retries"],
-            "max_detail_retries": settings["max_detail_retries"],
-            "detail_timeout_ms": settings["detail_page_timeout_ms"],
-            "delay_between_pages": ",".join(str(value) for value in settings["delays"]["between_pages"]),
-            "auth_wait_seconds": settings["auth_wait_seconds"],
-            "user_data_dir": str(settings["user_data_dir"]),
-            "profile_ready": profile_ready(Path(settings["user_data_dir"])),
-            "zhaopin_user_data_dir": str(settings["zhaopin_user_data_dir"]),
-            "zhaopin_profile_ready": profile_ready(Path(settings["zhaopin_user_data_dir"])),
-            "scrapling_real_chrome": settings["scrapling_real_chrome"],
-            "scrapling_google_search": settings["scrapling_google_search"],
-            "scrapling_block_webrtc": settings["scrapling_block_webrtc"],
-            "scrapling_hide_canvas": settings["scrapling_hide_canvas"],
-            "skip_detail_fetch": settings["skip_detail_fetch"],
-            "gologin_token_set": bool(settings.get("gologin_token", "")),
-            "gologin_profile_id": settings.get("gologin_profile_id", ""),
-        }
-    except Exception:
-        payload = {
-            "keywords": "",
-            "regions": "",
-            "platform": "zhaopin",
-            "browser_backend": "playwright",
-            "max_pages": 1,
-            "headless": True,
-            "max_empty_retries": 2,
-            "max_detail_retries": 1,
-            "detail_timeout_ms": 90000,
-            "delay_between_pages": "1.8,3.0",
-            "auth_wait_seconds": 120,
-            "user_data_dir": str(BASE_DIR / "auth" / "51job_profile"),
-            "profile_ready": False,
-            "zhaopin_user_data_dir": str(BASE_DIR / "auth" / "zhaopin_profile"),
-            "zhaopin_profile_ready": False,
-            "scrapling_real_chrome": False,
-            "scrapling_google_search": False,
-            "scrapling_block_webrtc": True,
-            "scrapling_hide_canvas": True,
-            "skip_detail_fetch": True,
-            "gologin_token_set": False,
-            "gologin_profile_id": "",
-        }
-    return jsonify(payload)
+    return jsonify(load_ui_defaults())
+
+
+@app.post("/api/defaults")
+def api_save_defaults():
+    payload = request.get_json(force=True) or {}
+    save_ui_defaults(payload)
+    return jsonify(load_ui_defaults())
+
+
+@app.post("/api/defaults/reset")
+def api_reset_defaults():
+    reset_ui_defaults()
+    return jsonify(load_ui_defaults())
 
 
 @app.get("/api/51job/auth")
@@ -843,6 +934,7 @@ def api_tasks():
 @app.post("/api/tasks")
 def api_create_task():
     payload = request.get_json(force=True) or {}
+    save_ui_defaults(payload)
     keywords = parse_csv(payload.get("keywords"))
     regions = parse_csv(payload.get("regions"))
     if not keywords:
@@ -904,6 +996,9 @@ def api_create_task():
         created_at=now_iso(),
         max_pages=max_pages,
         headless=headless,
+        skip_detail_fetch=parse_bool(payload.get("skip_detail_fetch"), False),
+        refetch_crawled_details=parse_bool(payload.get("refetch_crawled_details"), False),
+        filter_existing_output_early=parse_bool(payload.get("filter_existing_output_early"), False),
     )
     task.log("Task queued.")
     with tasks_lock:

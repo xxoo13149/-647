@@ -769,6 +769,7 @@ async def login_zhaopin_profile(settings: dict[str, Any]) -> None:
                 viewport=settings["viewport"],
                 locale="zh-CN",
             )
+        # 仅标准 Chrome 加反检测脚本；Orbita 二进制已内置
         await context.add_init_script(
             STEALTH_INIT_SCRIPT,
         )
@@ -1035,7 +1036,7 @@ async def search_keyword_in_city(
     """按关键词 + 城市名称直达搜索页，确保输入岗位和地区同时生效。"""
     target_url = build_search_url(keyword=keyword, city_name=city_name, page=1)
     try:
-        await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
     except Exception as e:
         print(f"导航到搜索页超时/失败（可能触发验证）：{e}")
 
@@ -1151,9 +1152,6 @@ async def crawl_zhaopin(
                 user_agent=settings["user_agent"],
                 viewport=settings["viewport"],
                 locale="zh-CN",
-            )
-            await context.add_init_script(
-                STEALTH_INIT_SCRIPT,
             )
         else:
             zhaopin_user_data_dir = Path(settings["zhaopin_user_data_dir"])
